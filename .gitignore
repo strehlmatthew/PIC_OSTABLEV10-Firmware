@@ -1,0 +1,24 @@
+# IDE/Tooling Files
+.vs/
+PICOLINKV1/.vs/
+*.ipch
+*.pch
+*.db
+*.suo
+*.user
+[Dd]ebug/
+[Rr]elease/
+*.obj
+*.dll
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+*.recipe
+*.res
+# Operating System Files
+.DS_Store
+Thumbs.db
+**/Debug/
+**/Release/
