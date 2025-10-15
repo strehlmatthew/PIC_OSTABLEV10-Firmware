@@ -2,7 +2,6 @@
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <LittleFS.h>
-
 // ----------------------------
 // TFT CONFIGURATION
 // ----------------------------
@@ -33,6 +32,9 @@ const size_t BLOCK_SIZE = 512;
 // SERIAL UPLOAD IMPLEMENTATION
 // ----------------------------
 bool fsReady = false;
+int formatIndex = 0;
+#define WDT_DISABLE() wdt_disable_platform()
+#define WDT_ENABLE() wdt_enable_platform()
 /**
  * @brief Reads a specific number of bytes from the serial port with a timeout.
  * * This is crucial for reading binary data. It blocks until the required bytes 
@@ -160,11 +162,11 @@ int kbIndex = 0; // current character index (0 = mode label)
 // ----------------------------
 // F-Key Prompting States
 // ----------------------------
-enum FKeyState { F_INACTIVE, F2_AWAIT_CHAR, F4_AWAIT_CHAR, F7_AWAIT_INDEX, F9_AWAIT_INDEX };
+enum FKeyState { F_INACTIVE, F2_AWAIT_CHAR, F4_AWAIT_CHAR, F7_AWAIT_INDEX, F9_AWAIT_INDEX, F_AWAIT_FORMAT_CONFIRM};
 FKeyState fkeyState = F_INACTIVE;
 String lastCommand = ""; 
 int f1_copy_index = 0; 
-
+extern bool awaitingFormatConfirm; 
 // Helper function to get the current mode's name (for mode label and preview)
 const char* kbGetModeName() {
     // FIX: Removed the check for fkeyState to allow the current mode name (ALPHA, NUM, etc.) to be displayed.
@@ -250,6 +252,16 @@ void calculateFullWrapSegments(const String &input, String outLines[], int &coun
 const char* kbGetModeName();
 void drawMultiColorString(const String &text, int lineNum, int x_start);
 void executeCat(String filename);
+
+void wdt_disable_platform() {
+    // This is the correct function call for most RP2040 cores 
+    // to stop the watchdog timer gracefully.
+    watchdog_disable(); 
+}
+void wdt_enable_platform() {
+    // If your WDT implementation requires setup, place it here. 
+    // For now, an empty function is safe to prevent immediate re-triggering issues.
+}
 
 // Calculates the wrapped segments of the ENTIRE command buffer content.
 void calculateFullWrapSegments(const String &input, String outLines[], int &count, int maxOut, bool startsAsContinuation) {
@@ -509,9 +521,74 @@ void drawFullTerminal() {
 
     drawCursorAndPreview();
 }
-// drawCursorAndPreview() 
+
 // drawCursorAndPreview() 
 void drawCursorAndPreview() {
+    
+    // --- Constant Definitions for Drawing ---
+    const int PROMPT_LEN = 7; 
+    const int CURSOR_COL = PROMPT_LEN; 
+    
+    int y_pos = (MAX_LINES - 1) * LINE_HEIGHT;
+    
+    // ------------------------------------------------------------------
+    // *** FORMAT CONFIRMATION DRAWING LOGIC (FINAL PADDING FIX) ***
+    // ------------------------------------------------------------------
+    if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
+        
+        // 1. Setup Padding Variables
+        int drawX = CURSOR_COL * CHAR_WIDTH;
+        int drawY = y_pos;
+        int padX = drawX - 1;
+        int padY = drawY - 1;
+        // CORRECTED: Restoring width to CHAR_WIDTH + 3 for the Y/N cursor.
+        int padW = CHAR_WIDTH + 3; 
+        int padH = LINE_HEIGHT + 1;
+        
+        // 3. Determine the character and its colors
+        char displayChar = ' ';
+        uint16_t fg_color = ST77XX_WHITE; 
+        uint16_t bg_color = ST77XX_BLACK; 
+        
+        if (formatIndex == 0) { // User selected 'Y'
+            displayChar = 'Y';
+            if (cursorVisible) {
+                // Cursor ON: BLACK text on Green background (Inverted)
+                fg_color = ST77XX_BLACK; 
+                bg_color = ST77XX_GREEN;
+            } else {
+                // Cursor OFF: Green text on Black background (Normal)
+                fg_color = ST77XX_GREEN;
+                bg_color = ST77XX_BLACK;
+            }
+        } else if (formatIndex == 1) { // User selected 'N'
+            displayChar = 'N';
+            if (cursorVisible) {
+                // Cursor ON: BLACK text on Red background (Inverted)
+                fg_color = ST77XX_BLACK;
+                bg_color = ST77XX_RED;
+            } else {
+                // Cursor OFF: Red text on Black background (Normal)
+                fg_color = ST77XX_RED;
+                bg_color = ST77XX_BLACK;
+            }
+        }
+
+        // 4. Draw the single blinking character block
+        tft.fillRect(padX, padY, padW, padH, bg_color); // Draw the background (with 1px padding)
+
+        tft.setCursor(drawX, drawY); 
+        tft.setTextColor(fg_color, bg_color);
+        tft.print(displayChar);
+
+        // 5. Clear the rest of the line after the cursor block
+        tft.fillRect(padX + padW, padY, SCREEN_WIDTH - (padX + padW), padH, ST77XX_BLACK);
+
+        // Reset colors and exit
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); 
+        return; 
+    }
+
     static int lastPreviewCols = 0;
     static int lastCursorCol = -1;
     static int lastCursorRowY = -1;
@@ -679,7 +756,7 @@ void drawCursorAndPreview() {
         int drawX = drawCol * CHAR_WIDTH;
         int padX = drawX - 1;
         int padY = drawRowY - 1;
-        int padW = CHAR_WIDTH + 2;
+        int padW = CHAR_WIDTH + 2; // Standard cursor width remains CHAR_WIDTH + 2
         int padH = LINE_HEIGHT + 1;
 
         if (cursorVisible) {
@@ -968,6 +1045,17 @@ void addHistory(const String &line) {
 // ----------------------------
 
 void kbPrev() {
+    if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
+        // Use the dedicated formatIndex instead of kbIndex
+        formatIndex--;
+        // Constrain the index to wrap back to 1 ('N') if it falls below 0 ('Y')
+        if (formatIndex < 0) { 
+            formatIndex = 1; 
+        }
+        // NOTE: drawCursorAndPreview() must be updated to use formatIndex
+        drawCursorAndPreview(); 
+        return; 
+    }
     kbIndex--;
     if (kbIndex < 0) {
         // ALPHA modes wrap to the [CASE]/[case] key at X + 3
@@ -982,6 +1070,17 @@ void kbPrev() {
     }
 }
 void kbNext() {
+    if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
+        // Use the dedicated formatIndex instead of kbIndex
+        formatIndex++;
+        // Constrain the index to wrap back to 0 ('Y') if it exceeds 1 ('N')
+        if (formatIndex > 1) { 
+            formatIndex = 0; 
+        }
+        // NOTE: drawCursorAndPreview() must be updated to use formatIndex
+        drawCursorAndPreview(); 
+        return;
+    }
     int maxIndex = 0;
     
     // ALPHA modes have the extra [CASE]/[case] key at X + 3
@@ -1007,175 +1106,8 @@ void kbNext() {
     if (kbIndex > maxIndex) {
         kbIndex = 0;
     }
+    drawCursorAndPreview();
 }
-// Function to handle the specific F-key actions
-void handleFKeyAction(int fKeyNumber) {
-    // Reset F1 index on new F-key press unless it is F1
-    if (fKeyNumber != 1) {
-        f1_copy_index = 0;
-    }
-    
-    // All F-key actions should reset historyIndex to the "new command" state 
-    // unless they specifically manipulate the history (F5, F8).
-    if (fKeyNumber != 5 && fKeyNumber != 8) {
-        historyIndex = historyCount;
-    }
-
-    // F-key specific actions
-    switch (fKeyNumber) {
-        case 1: // F1: Repeats the letters of the last command line, one by one.
-            if (lastCommand.length() > 0) {
-                if (f1_copy_index < lastCommand.length()) {
-                    insertCharAtCursor(lastCommand.charAt(f1_copy_index));
-                    f1_copy_index++;
-                } else {
-                    f1_copy_index = 0; // Wrap/restart
-                }
-            } else {
-                pushSystemMessage("No last command for F1.");
-            }
-            break;
-        case 2: // F2: Prompts the user to "enter the char to copy up to" from the last command line
-            if (lastCommand.length() > 0) {
-                fkeyState = F2_AWAIT_CHAR;
-                pushSystemMessage("F2: Enter char to copy up to:");
-            } else {
-                 pushSystemMessage("No last command for F2.");
-            }
-            break;
-        case 3: // F3: Repeats the entire last command line.
-            if (lastCommand.length() > 0) {
-                clearCurrentCommand();
-                insertStringAtCursor(lastCommand);
-            } else {
-                pushSystemMessage("No last command for F3.");
-            }
-            break;
-        case 4: // F4: Prompts the user to "enter the char to delete up to" from the current command line
-            if (cmdLen > 0) {
-                fkeyState = F4_AWAIT_CHAR;
-                pushSystemMessage("F4: Enter char to delete up to:");
-            } else {
-                pushSystemMessage("Command line is empty for F4.");
-            }
-            break;
-        case 5: // F5: Recalls the previous command line from the history (newest, no cycling).
-            if (historyCount > 0) {
-                // F5: Recall the absolute newest command
-                historyIndex = historyCount - 1; 
-                loadHistoryCommand(historyIndex % HISTORY_SIZE);
-                historyIndex = historyCount; // Set back to new command state after loading
-            } else {
-                pushSystemMessage("History is empty for F5.");
-            }
-            break;
-        case 6: // F6: Inserts the traditional CTRL+Z (^z) character.
-            insertCharAtCursor('\x1A');
-            break;
-            
-        case 7: // F7: Displays command history and awaits index for insertion.
-            if (historyCount > 0) {
-                pushSystemMessage("--- Command History (0-" + String(historyCount - 1) + ") ---");
-                for (int i = 0; i < historyCount; ++i) { 
-                    String h = String(i) + ": " + history[i % HISTORY_SIZE];
-                    pushScrollback(h);
-                }
-                
-                // 1. Set the new state to await numeric index input
-                fkeyState = F7_AWAIT_INDEX; 
-                
-                // 2. FIX: Switch the keyboard to the NUMERIC layer for easy entry
-                kmode = NUM; 
-                kbIndex = 0; // Reset index for the new mode
-                
-                // 3. Push instruction prompt
-                pushSystemMessage("Enter history index (0-" + String(historyCount - 1) + ") and press ENTER to insert:");
-            } else { 
-                pushSystemMessage("History is empty for F7."); 
-            } 
-            break;
-        case 8: // F8: Cycles back through previous command lines. (Simplified to recall down)
-            historyRecallDown();
-            break;
-            
-        case 9: // F9: Prompts the user to enter a command number (0-9). (Simplified to single digit)
-            if (historyCount > 0) {
-                fkeyState = F9_AWAIT_INDEX;
-                pushSystemMessage("F9: Enter history command number (0-9):");
-            } else {
-                pushSystemMessage("History is empty for F9.");
-            }
-            break;
-            
-        // F10, F11, F12 default to text insertion
-        default:
-            insertCharAtCursor('[');
-            for (int i = 0; i < funcKeys[fKeyNumber - 1].length(); ++i) insertCharAtCursor(funcKeys[fKeyNumber - 1].charAt(i));
-            insertCharAtCursor(']');
-            break;
-    }
-
-    // Always redraw full terminal after an F-key action (except F1)
-    if (fKeyNumber != 1) {
-        drawFullTerminal(); 
-    }
-}
-
-// Function to handle awaited input for F2, F4, F9
-void handleFKeyInput(char inputChar) {
-    if (fkeyState == F2_AWAIT_CHAR) {
-        // F2: Copy up to char from last command
-        int targetIndex = lastCommand.indexOf(inputChar);
-        if (targetIndex != -1) {
-            String sub = lastCommand.substring(0, targetIndex + 1);
-            clearCurrentCommand();
-            insertStringAtCursor(sub);
-            pushSystemMessage("Copied last command up to '" + String(inputChar) + "'.");
-        } else {
-            pushSystemMessage("Char '" + String(inputChar) + "' not found in last command.");
-        }
-        fkeyState = F_INACTIVE;
-    } else if (fkeyState == F4_AWAIT_CHAR) {
-        // F4: Delete up to char from current command
-        String currentCmd = String(cmdBuf).substring(0, cmdLen);
-        int targetIndex = currentCmd.indexOf(inputChar);
-        if (targetIndex != -1) {
-            int deleteCount = targetIndex + 1;
-            // Shift remaining characters left
-            for (int i = 0; i < cmdLen - deleteCount; ++i) {
-                cmdBuf[i] = cmdBuf[i + deleteCount];
-            }
-            cmdLen -= deleteCount;
-            cmdBuf[cmdLen] = 0;
-            cursorPos = 0; // Cursor moves to the start
-            pushSystemMessage("Deleted current command up to '" + String(inputChar) + "'.");
-        } else {
-            pushSystemMessage("Char '" + String(inputChar) + "' not found in current command.");
-        }
-        fkeyState = F_INACTIVE;
-    } else if (fkeyState == F9_AWAIT_INDEX) {
-        // F9: Recall command by number (0-9)
-        if (inputChar >= '0' && inputChar <= '9') {
-            int index = inputChar - '0';
-            if (index < historyCount) {
-                loadHistoryCommand(index % HISTORY_SIZE);
-                historyIndex = historyCount; // Set back to new command state after loading
-                pushSystemMessage("Recalled history item " + String(index) + ".");
-            } else {
-                pushSystemMessage("Index " + String(index) + " is out of history range (0-" + String(historyCount > 0 ? historyCount - 1 : 0) + ").");
-            }
-        } else {
-            pushSystemMessage("Invalid history index. Must be a digit 0-9.");
-        }
-        fkeyState = F_INACTIVE;
-    }
-    
-    // Final state cleanup and redraw
-    kmode = ALPHA;
-    kbIndex = 0;
-    drawFullTerminal(); 
-}
-
 void kbConfirm() {
     char charToInsert = 0;
     String controlAction = "";
@@ -1205,19 +1137,76 @@ void kbConfirm() {
                  // For F7, insert the digit and do NOT call the handler.
                  insertCharAtCursor(inputChar);
             } else {
-                // For F2/F4/F9, insert the char and then call the handler to execute the action and reset state.
-                insertCharAtCursor(inputChar);
-                handleFKeyInput(inputChar);
+                 // For F2/F4/F9, insert the char and then call the handler to execute the action and reset state.
+                 insertCharAtCursor(inputChar);
+                 handleFKeyInput(inputChar);
             }
             // Always return after inserting a character in F-key mode.
             return; 
         } 
     }
 
+
+// --- FIX: 1.5. Handle Format Confirmation Selection (The fixed block) ---
+    if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
+        
+        // 1. CAPTURE the user's choice.
+        int confirmedIndex = formatIndex; // This is 0 for Y, 1 for N
+
+        // 2. STATE RESET (CRITICAL: MUST HAPPEN NOW TO AVOID CONFLICTS)
+        // Resetting kbIndex to 0 here is SAFE because we captured confirmedIndex
+        // and we are about to exit the confirmation state completely.
+        fkeyState = F_INACTIVE;
+        kmode = ALPHA; 
+        kbIndex = 0; // The fix: kbIndex=0 (Mode Key) is harmless if fallthrough occurs.
+        cmdLen = 0;
+        cursorPos = 0; 
+        cmdBuf[0] = '\0';
+        cursorVisible = true;
+        
+        // 3. EXECUTE the action based on the captured choice.
+        bool willFormat = (confirmedIndex == 0); // 'Y' is at index 0.
+
+        if (willFormat) { 
+            pushSystemMessage("Format selection confirmed. Executing format...");
+            drawFullTerminal(); // Draw message before blocking call.
+            formatFilesystem();
+        } else { 
+            pushSystemMessage("Format cancelled.");
+            // NOTE: We no longer return here. We proceed to cleanup (step 4).
+        }
+        
+        // 4. PERFORM FINAL STATE CLEANUP AND REDRAW (CRITICAL: Both Yes and No run this)
+        
+        // Reset CLI drawing state
+        terminalScrollOffset = 0; 
+        inputWrapped = false; 
+        historyIndex = historyCount; 
+
+        // 4a. SWAP ORDER: CLEAR ARTIFACTS FIRST 
+        // ** EXPANDED ARTIFACT FIX to full line **
+        const int y_pos_start = (MAX_LINES - 1) * LINE_HEIGHT; 
+        const int start_y = y_pos_start - 1;
+        const int y_height = LINE_HEIGHT + 1; 
+        
+        // Wipe the entire last line of the screen to remove Y/N remnants
+        tft.fillRect(0, start_y, SCREEN_WIDTH, y_height, ST77XX_BLACK); 
+        
+        // 4b. Redraw the full terminal (Draws the clean PICOS> prompt)
+        drawFullTerminal(); 
+
+        // 4c. Redraw the new [ALPHA] mode label and cursor.
+        drawCursorAndPreview(); 
+        
+        // 5. ENSURE the function exits and does not fall through.
+        return;
+    }
+
+    // ... (rest of the kbConfirm function logic)
     // --- 2. Mode Switch Logic (for Mode Label key, kbIndex=0) ---
     if (kbIndex == 0) {
         if (fkeyState != F_INACTIVE && kmode == FUNC_VIEW) {
-// Original logic preserved
+        // Original logic preserved
         } else if (kmode == FUNC_VIEW) {
             kmode = CTRL;
         } else {
@@ -1465,6 +1454,174 @@ void kbConfirm() {
         drawCursorAndPreview();
     }
 }
+// Function to handle the specific F-key actions
+void handleFKeyAction(int fKeyNumber) {
+    // Reset F1 index on new F-key press unless it is F1
+    if (fKeyNumber != 1) {
+        f1_copy_index = 0;
+    }
+    
+    // All F-key actions should reset historyIndex to the "new command" state 
+    // unless they specifically manipulate the history (F5, F8).
+    if (fKeyNumber != 5 && fKeyNumber != 8) {
+        historyIndex = historyCount;
+    }
+
+    // F-key specific actions
+    switch (fKeyNumber) {
+        case 1: // F1: Repeats the letters of the last command line, one by one.
+            if (lastCommand.length() > 0) {
+                if (f1_copy_index < lastCommand.length()) {
+                    insertCharAtCursor(lastCommand.charAt(f1_copy_index));
+                    f1_copy_index++;
+                } else {
+                    f1_copy_index = 0; // Wrap/restart
+                }
+            } else {
+                pushSystemMessage("No last command for F1.");
+            }
+            break;
+        case 2: // F2: Prompts the user to "enter the char to copy up to" from the last command line
+            if (lastCommand.length() > 0) {
+                fkeyState = F2_AWAIT_CHAR;
+                pushSystemMessage("F2: Enter char to copy up to:");
+            } else {
+                 pushSystemMessage("No last command for F2.");
+            }
+            break;
+        case 3: // F3: Repeats the entire last command line.
+            if (lastCommand.length() > 0) {
+                clearCurrentCommand();
+                insertStringAtCursor(lastCommand);
+            } else {
+                pushSystemMessage("No last command for F3.");
+            }
+            break;
+        case 4: // F4: Prompts the user to "enter the char to delete up to" from the current command line
+            if (cmdLen > 0) {
+                fkeyState = F4_AWAIT_CHAR;
+                pushSystemMessage("F4: Enter char to delete up to:");
+            } else {
+                pushSystemMessage("Command line is empty for F4.");
+            }
+            break;
+        case 5: // F5: Recalls the previous command line from the history (newest, no cycling).
+            if (historyCount > 0) {
+                // F5: Recall the absolute newest command
+                historyIndex = historyCount - 1; 
+                loadHistoryCommand(historyIndex % HISTORY_SIZE);
+                historyIndex = historyCount; // Set back to new command state after loading
+            } else {
+                pushSystemMessage("History is empty for F5.");
+            }
+            break;
+        case 6: // F6: Inserts the traditional CTRL+Z (^z) character.
+            insertCharAtCursor('\x1A');
+            break;
+            
+        case 7: // F7: Displays command history and awaits index for insertion.
+            if (historyCount > 0) {
+                pushSystemMessage("--- Command History (0-" + String(historyCount - 1) + ") ---");
+                for (int i = 0; i < historyCount; ++i) { 
+                    String h = String(i) + ": " + history[i % HISTORY_SIZE];
+                    pushScrollback(h);
+                }
+                
+                // 1. Set the new state to await numeric index input
+                fkeyState = F7_AWAIT_INDEX; 
+                
+                // 2. FIX: Switch the keyboard to the NUMERIC layer for easy entry
+                kmode = NUM; 
+                kbIndex = 0; // Reset index for the new mode
+                
+                // 3. Push instruction prompt
+                pushSystemMessage("Enter history index (0-" + String(historyCount - 1) + ") and press ENTER to insert:");
+            } else { 
+                pushSystemMessage("History is empty for F7."); 
+            } 
+            break;
+        case 8: // F8: Cycles back through previous command lines. (Simplified to recall down)
+            historyRecallDown();
+            break;
+            
+        case 9: // F9: Prompts the user to enter a command number (0-9). (Simplified to single digit)
+            if (historyCount > 0) {
+                fkeyState = F9_AWAIT_INDEX;
+                pushSystemMessage("F9: Enter history command number (0-9):");
+            } else {
+                pushSystemMessage("History is empty for F9.");
+            }
+            break;
+            
+        // F10, F11, F12 default to text insertion
+        default:
+            insertCharAtCursor('[');
+            for (int i = 0; i < funcKeys[fKeyNumber - 1].length(); ++i) insertCharAtCursor(funcKeys[fKeyNumber - 1].charAt(i));
+            insertCharAtCursor(']');
+            break;
+    }
+
+    // Always redraw full terminal after an F-key action (except F1)
+    if (fKeyNumber != 1) {
+        drawFullTerminal(); 
+    }
+}
+
+// Function to handle awaited input for F2, F4, F9
+void handleFKeyInput(char inputChar) {
+    if (fkeyState == F2_AWAIT_CHAR) {
+        // F2: Copy up to char from last command
+        int targetIndex = lastCommand.indexOf(inputChar);
+        if (targetIndex != -1) {
+            String sub = lastCommand.substring(0, targetIndex + 1);
+            clearCurrentCommand();
+            insertStringAtCursor(sub);
+            pushSystemMessage("Copied last command up to '" + String(inputChar) + "'.");
+        } else {
+            pushSystemMessage("Char '" + String(inputChar) + "' not found in last command.");
+        }
+        fkeyState = F_INACTIVE;
+    } else if (fkeyState == F4_AWAIT_CHAR) {
+        // F4: Delete up to char from current command
+        String currentCmd = String(cmdBuf).substring(0, cmdLen);
+        int targetIndex = currentCmd.indexOf(inputChar);
+        if (targetIndex != -1) {
+            int deleteCount = targetIndex + 1;
+            // Shift remaining characters left
+            for (int i = 0; i < cmdLen - deleteCount; ++i) {
+                cmdBuf[i] = cmdBuf[i + deleteCount];
+            }
+            cmdLen -= deleteCount;
+            cmdBuf[cmdLen] = 0;
+            cursorPos = 0; // Cursor moves to the start
+            pushSystemMessage("Deleted current command up to '" + String(inputChar) + "'.");
+        } else {
+            pushSystemMessage("Char '" + String(inputChar) + "' not found in current command.");
+        }
+        fkeyState = F_INACTIVE;
+    } else if (fkeyState == F9_AWAIT_INDEX) {
+        // F9: Recall command by number (0-9)
+        if (inputChar >= '0' && inputChar <= '9') {
+            int index = inputChar - '0';
+            if (index < historyCount) {
+                loadHistoryCommand(index % HISTORY_SIZE);
+                historyIndex = historyCount; // Set back to new command state after loading
+                pushSystemMessage("Recalled history item " + String(index) + ".");
+            } else {
+                pushSystemMessage("Index " + String(index) + " is out of history range (0-" + String(historyCount > 0 ? historyCount - 1 : 0) + ").");
+            }
+        } else {
+            pushSystemMessage("Invalid history index. Must be a digit 0-9.");
+        }
+        fkeyState = F_INACTIVE;
+    }
+    
+    // Final state cleanup and redraw
+    kmode = ALPHA;
+    kbIndex = 0;
+    drawFullTerminal(); 
+}
+
 // ----------------------------
 // Command parsing & execution helpers
 // ----------------------------
@@ -1728,7 +1885,29 @@ void executeCommandLine(const String &raw) {
                 pushSystemMessage("Deleted " + tokens[1] + ".");
             else pushSystemMessage("Error: File not found or couldn't be deleted.");
         }
-
+        } else if (cmd == "rm") {
+        if (count < 2) pushSystemMessage("Usage: rm <filename>");
+        else {
+            if (removeFile(tokens[1]))
+                pushSystemMessage("Deleted " + tokens[1] + ".");
+            else pushSystemMessage("Error: File not found or couldn't be deleted.");
+        }
+    } else if (cmd == "f") { 
+        if (!fsReady) {
+            pushSystemMessage("Error: LittleFS not available. Cannot format.");
+        } else if (fkeyState != F_INACTIVE) {
+            pushSystemMessage("Error: Already in special input mode.");
+        } else {
+            // --- ENTER CONFIRMATION MODE ---
+            pushSystemMessage("WARNING: Select Y/N to confirm full filesystem erase.");
+            
+            fkeyState = F_AWAIT_FORMAT_CONFIRM; 
+            kbIndex = 0; // Start selection on 'Y' (kbIndex 0 = Y, 0 = N)
+            // No need to change kmode, as kbConfirm/draw functions will ignore it.
+            
+            // Draw the new confirmation prompt immediately.
+            drawFullTerminal(); 
+        }
     } else if (cmd == "pi") {
         String piValue = String(PI_VALUE, 18);
         String piString = "Pi = " + piValue;
@@ -1875,7 +2054,50 @@ bool removeFile(const String &path) {
     if (!LittleFS.exists(path)) return false;
     return LittleFS.remove(path);
 }
+/**
+ * @brief Formats the LittleFS filesystem, managing the Watchdog Timer (WDT).
+ * @return true if format and remount were successful, false otherwise.
+ */
+bool formatFilesystem() {
+    pushSystemMessage("Initiating file system format. LONG OPERATION - DO NOT POWER OFF!");
+    
+    // 1. Unmount the filesystem (required before formatting)
+    LittleFS.end();
+    
+    // 2. WATCHDOG TIMER MANAGEMENT (CRITICAL)
+    // IMPORTANT: Formatting takes several seconds and will trigger the WDT.
+    // Replace WDT_DISABLE() and WDT_ENABLE() with your specific platform calls 
+    // (e.g., ESP.wdtDisable(), watchDog.disable(), etc.)
+    // If you do not have a WDT function, define a macro that does nothing (e.g., #define WDT_DISABLE() )
+    WDT_DISABLE(); 
 
+    // 3. Execute the actual format
+    bool success = LittleFS.format(); 
+
+    // 4. Re-enable WDT immediately
+    WDT_ENABLE();
+
+    if (success) {
+        pushSystemMessage("LittleFS format complete.");
+        
+        // 5. Attempt to remount the newly formatted filesystem
+        if (LittleFS.begin()) {
+            pushSystemMessage("LittleFS remounted successfully.");
+            fsReady = true;
+            return true;
+        } else {
+            pushSystemMessage("Fatal Error: LittleFS remount failed after format!");
+            fsReady = false;
+            return false;
+        }
+    } else {
+        pushSystemMessage("Error: LittleFS format failed!");
+        fsReady = false;
+        return false;
+    }
+}
+
+// NOTE: You must ensure WDT_DISABLE() and WDT_ENABLE() are defined in your sketch.
 // ----------------------------
 // FILE SENDING (PC -> PICO)
 // ----------------------------
