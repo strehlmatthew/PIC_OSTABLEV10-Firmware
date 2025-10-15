@@ -542,7 +542,7 @@ void drawCursorAndPreview() {
         int padX = drawX - 1;
         int padY = drawY - 1;
         // CORRECTED: Restoring width to CHAR_WIDTH + 3 for the Y/N cursor.
-        int padW = CHAR_WIDTH + 3; 
+        int padW = CHAR_WIDTH + 1; 
         int padH = LINE_HEIGHT + 1;
         
         // 3. Determine the character and its colors
@@ -756,7 +756,7 @@ void drawCursorAndPreview() {
         int drawX = drawCol * CHAR_WIDTH;
         int padX = drawX - 1;
         int padY = drawRowY - 1;
-        int padW = CHAR_WIDTH + 2; // Standard cursor width remains CHAR_WIDTH + 2
+        int padW = CHAR_WIDTH + 1; // Standard cursor width remains CHAR_WIDTH + 2
         int padH = LINE_HEIGHT + 1;
 
         if (cursorVisible) {
@@ -1801,9 +1801,10 @@ void executeCommandLine(const String &raw) {
         pushScrollback("rm <file>    - Delete a file.");
         pushScrollback("ver          - Display version info.");
         pushScrollback("time         - Show uptime since boot.");
-        pushScrollback("fkey        - Show F-key functions.");
+        pushScrollback("fkey         - Show F-key functions.");
         pushScrollback("send <file>  - Send file to host via serial.");
-        
+        pushScrollback("format       - Format LT-FS partition.");
+
     } else if (cmd == "fkey") {
         pushScrollback("--- F-Key functionality: ---");
         pushScrollback("F2: Copy last cmd up to char.");
@@ -1892,14 +1893,14 @@ void executeCommandLine(const String &raw) {
                 pushSystemMessage("Deleted " + tokens[1] + ".");
             else pushSystemMessage("Error: File not found or couldn't be deleted.");
         }
-    } else if (cmd == "f") { 
+    } else if (cmd == "format") { 
         if (!fsReady) {
-            pushSystemMessage("Error: LittleFS not available. Cannot format.");
+            pushSystemMessage("Error: LittleFS not available. Terminating...");
         } else if (fkeyState != F_INACTIVE) {
             pushSystemMessage("Error: Already in special input mode.");
         } else {
             // --- ENTER CONFIRMATION MODE ---
-            pushSystemMessage("WARNING: Select Y/N to confirm full filesystem erase.");
+            pushSystemMessage("WARNING: Select Y/N to confirm FORMAT!");
             
             fkeyState = F_AWAIT_FORMAT_CONFIRM; 
             kbIndex = 0; // Start selection on 'Y' (kbIndex 0 = Y, 0 = N)
@@ -2122,10 +2123,13 @@ void executeUpload(String filename, size_t fileSize) {
     if (!fsReady) {
         Serial.println("FATAL ERROR: LittleFS not available.");
         pushSystemMessage("Error: LittleFS not available.");
+        drawFullTerminal();
         return;
     }
 
-    pushSystemMessage("Receiving file: " + filename + " (" + String(fileSize) + " bytes)");
+    pushSystemMessage("DOWNLOADING: " + filename + " (" + String(fileSize) + " bytes)");
+    drawFullTerminal(); 
+    delay(50); // Pause briefly to ensure the message is fully drawn to the TFT
 
     if (filename.startsWith("/")) {
         filename = filename.substring(1);
@@ -2135,7 +2139,7 @@ void executeUpload(String filename, size_t fileSize) {
     File outFile = LittleFS.open(filename, "w");
     if (!outFile) {
         Serial.println("FATAL ERROR: Could not open file for writing.");
-        pushSystemMessage("Upload Failed: Cannot open file.");
+        pushSystemMessage("DOWNLOAD FAILED: Cannot open file.");
         return;
     }
 
@@ -2187,11 +2191,13 @@ void executeUpload(String filename, size_t fileSize) {
         Serial.print(filename);
         Serial.print(" ");
         Serial.println(fileSize);
-        pushSystemMessage("Upload SUCCESS: " + filename + " saved.");
+        pushSystemMessage("SUCCESS: " + filename + " saved.");
     } else {
-        pushSystemMessage("Upload FAILED. Removing partial file.");
+        pushSystemMessage("DOWNLOAD FAILED. Removing file.");
         LittleFS.remove(filename);
     }
+    drawFullTerminal(); 
+    delay(50); // Pause briefly (50ms) to ensure the TFT completes the final draw
 }
 // ----------------------------
 // FILE RECEIVING (PICO -> PC)
@@ -2278,9 +2284,6 @@ void handleSerialCommands() {
 
                 cmdLine.trim();
                 if (cmdLine.length() == 0) continue;
-
-                // PUSH MESSAGE TO LOCAL TERMINAL
-                pushSystemMessage("Cmd received: " + cmdLine);
 
                 // Extract command word for logic
                 int firstSpace = cmdLine.indexOf(' ');
