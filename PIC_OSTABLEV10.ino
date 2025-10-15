@@ -1416,6 +1416,20 @@ void kbConfirm() {
             
             fullCommand += currentInput;
             
+            // --- START OF FIX: CHECK FOR EMPTY COMMAND ---
+            String trimmedCommand = trimStr(fullCommand); 
+
+            if (trimmedCommand.length() == 0) {
+                // If the command is empty (or only whitespace), 
+                // clear the input buffer and redraw the screen, then exit.
+                clearCmdBuffer(); 
+                drawFullTerminal(); 
+                return; 
+            }
+            // --- END OF FIX ---
+            
+            // Proceed with scrollback and execution ONLY for non-empty commands
+            
             const int MAX_CHUNKS = 16;
             String fwdFinal[MAX_CHUNKS];
             int fwdCountFinal = 0;
@@ -1599,7 +1613,11 @@ void tokenizeLine(const String &line, String tokens[], int &count, int maxTokens
 
 void executeCommandLine(const String &raw) {
     String line = trimStr(raw);
-    if (line.length() == 0) return;
+    if (line.length() == 0) {
+        drawFullTerminal(); 
+        clearCurrentCommand();
+        return;         
+    }
 
     // Add command to history
     addHistory(line); 
