@@ -15,12 +15,15 @@
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 
 // GLOBAL SYNCHRONIZATION OBJECTS
 std::mutex serialMutex; // Protects hSerial and related serial calls (e.g., PurgeComm, ReadFile, WriteFile)
 std::atomic<bool> protocolActive(false); // Flag: True when an upload/protocol sequence is in progress
 std::mutex msgMutex;    // Protects serialMessages
 std::string serialMessages; // Shared buffer for incoming serial data
+
 
 #undef min
 #define MAX_LOADSTRING 100
@@ -37,7 +40,7 @@ const size_t BLOCK_SIZE = 512;
 // --- TIMEOUT CONFIG ---
 const int READY_TIMEOUT_SECONDS = 10;
 const int ACK_TIMEOUT_SECONDS = 5;
-const int UPLOAD_OK_TIMEOUT_SECONDS = 10;
+const int UPLOAD_OK_TIMEOUT_SECONDS = 100;
 
 
 // Global Variables:
@@ -57,7 +60,6 @@ bool OpenSerialPort(const std::wstring& portName);
 void Log(const std::string& msg);
 void FlushSerialMessagesToLog(); // Function to display raw serial output
 void UploadFile();
-std::wstring GetPicoLinkFolder();
 void SendData(const char* data, DWORD size);
 void PicoListenerThread();
 
@@ -94,6 +96,17 @@ std::string wstring_to_string(const std::wstring& wstr)
     return strTo;
 }
 
+std::wstring GetDocumentsFolder()
+{
+    PWSTR pszPath = NULL;
+    // Uses SHGetKnownFolderPath to get the path to the user's Documents folder
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, NULL, &pszPath))) {
+        std::wstring path = pszPath;
+        CoTaskMemFree(pszPath);
+        return path;
+    }
+    return L""; // Return empty string on failure
+}
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
@@ -382,8 +395,6 @@ bool WaitForPicoResponse(const std::string& expectedMsg, const std::string& erro
     }
 }
 
-
-// *** CRITICAL UPLOAD FUNCTION WITH ACK FLOW CONTROL ***
 // *** CRITICAL UPLOAD FUNCTION WITH ACK FLOW CONTROL ***
 void UploadFile()
 {
@@ -429,11 +440,9 @@ void UploadFile()
     // Step 1: Send UPLOAD header
     std::stringstream cmd;
     cmd << "UPLOAD " << filename << " " << filesize_s << "\r\n";
-    std::string command_str = cmd.str();
+    std::string command_str = cmd.str(); // Contains the essential trailing "\r\n"
 
     // 2. CRITICAL: Clear the buffer now, BEFORE the command is sent.
-    // This ensures that WaitForPicoResponse only looks for the READY
-    // response to this specific command, not old junk or logs.
     {
         std::lock_guard<std::mutex> msgLock(msgMutex);
         serialMessages.clear();
@@ -442,25 +451,34 @@ void UploadFile()
     // Attempt to send the command
     SendData(command_str.c_str(), static_cast<DWORD>(command_str.size()));
 
-    // Log the actual command sent for debug
-    Log("Sent upload command: " + command_str);
+    // --- FIX FOR BLANK LINE ---
+    // Create a copy of the command string to trim for logging only.
+    std::string commandToLog = command_str;
 
+    // Trim trailing whitespace/newlines from the log string
+    commandToLog.erase(std::find_if(commandToLog.rbegin(), commandToLog.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+        }).base(), commandToLog.end());
+
+    // Log the trimmed command
+    Log("Sent upload command: " + commandToLog);
+    // --- END FIX ---
+
+    // Clear the buffer again, just in case the Pico echo'd the command immediately
     {
         std::lock_guard<std::mutex> msgLock(msgMutex);
         serialMessages.clear();
     }
 
     // 3. CRITICAL: Wait immediately for the READY response.
-    // The previous 1-second delay is removed.
     if (!WaitForPicoResponse(READY_MSG, "ERROR: Pico did not send READY", READY_TIMEOUT_SECONDS)) {
         Log("Upload aborted due to missing READY message.");
-        // ProtocolScopeGuard destructor handles cleanup
         return;
     }
 
     Log("Pico READY received, sending file with ACK flow control...");
 
-    // ... [rest of the upload logic] ...
+    // ... [rest of the upload logic remains the same] ...
     std::vector<char> buffer(BLOCK_SIZE);
     size_t sent = 0;
     bool success = true;
@@ -498,6 +516,148 @@ void UploadFile()
 
     Log("SUCCESS: File transfer complete. Total bytes sent: " + std::to_string(sent));
 }
+
+// Helper: Retrieves the Documents path, creates the "PicoLink Files" subfolder, and returns the path.
+// This definition replaces any previous incomplete definition you may have had.
+std::wstring GetPicoLinkFolder()
+{
+    // Ensure you have these includes at the top of your file:
+    // #include <ShlObj.h> 
+    // #include <filesystem> 
+
+    PWSTR pszPath = NULL;
+    std::wstring basePath;
+
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, NULL, &pszPath))) {
+        basePath = pszPath;
+        CoTaskMemFree(pszPath);
+    }
+    else {
+        Log("ERROR: Could not find Windows Documents folder path.");
+        return L"";
+    }
+
+    std::wstring picoLinkPath = basePath + L"\\PicoLink Files";
+
+    try {
+        if (!std::filesystem::exists(picoLinkPath)) {
+            std::filesystem::create_directories(picoLinkPath);
+            Log("Created folder: " + wstring_to_string(picoLinkPath));
+        }
+    }
+    catch (const std::filesystem::filesystem_error& e) {
+        // FIX: Using 'e' to resolve the 'unreferenced local variable' warning
+        Log("ERROR: Failed to create PicoLink folder: " + wstring_to_string(picoLinkPath) + ". Reason: " + e.what());
+        return L"";
+    }
+
+    return picoLinkPath;
+}
+
+// ----------------------------------------------------
+// CRITICAL: File Download Protocol Handler (Fixed Path and Data Types)
+// ----------------------------------------------------
+void HandleIncomingSend(const std::string& commandLine)
+{
+    // 1. Immediately SET the flag. This stops the listener thread from logging the file data.
+    protocolActive.store(true);
+    Log("Download initiated from Pico.");
+
+    // Use a scope guard to ensure the flag is cleared on exit
+    class ProtocolScopeGuard {
+    public:
+        ~ProtocolScopeGuard() {
+            protocolActive.store(false);
+            FlushSerialMessagesToLog();
+            Log("Download session concluded.");
+        }
+    } guard;
+
+    // --- Parse Command ---
+    std::stringstream ss(commandLine);
+    std::string command, filename_str;
+    // FIX: Use size_t for file size to match standard C++ practice and remove warning
+    size_t filesize_s = 0;
+
+    // Example commandLine: "SEND A.TXT 1\r\n"
+    if (!(ss >> command >> filename_str >> filesize_s) || command != "SEND") {
+        Log("ERROR: Invalid SEND command format received.");
+        return;
+    }
+
+    // --- Open Output File ---
+    // CRITICAL FIX: Use the new GetPicoLinkFolder function
+    std::wstring pico_folder_w = GetPicoLinkFolder();
+    if (pico_folder_w.empty()) {
+        Log("FATAL ERROR: Could not find or create PicoLink folder for saving.");
+        return;
+    }
+
+    std::wstring filename_w = std::wstring(filename_str.begin(), filename_str.end());
+    // Construct the full path: Documents\PicoLink Files\A.TXT
+    std::wstring full_path_w = pico_folder_w + L"\\" + filename_w;
+
+    std::ofstream outfile(full_path_w, std::ios::binary | std::ios::trunc);
+    if (!outfile.is_open()) {
+        Log("FATAL ERROR: Failed to open file for writing: " + wstring_to_string(full_path_w));
+        return;
+    }
+
+    Log("Receiving file: " + filename_str + " (" + std::to_string(filesize_s) + " bytes) to: " + wstring_to_string(full_path_w));
+
+    // --- Receive Data Loop ---
+    // FIX: Use size_t for byte counter
+    size_t bytesReceived = 0;
+
+    // Safety timeout (e.g., 5 seconds for a small file)
+    auto startTime = std::chrono::high_resolution_clock::now();
+    const auto timeout = std::chrono::seconds(30);
+
+    while (bytesReceived < filesize_s) {
+        if (std::chrono::high_resolution_clock::now() - startTime > timeout) {
+            Log("TIMEOUT: Download timed out before receiving all expected bytes.");
+            break;
+        }
+
+        // Yield to listener thread to ensure the buffer is fed
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        std::lock_guard<std::mutex> lock(msgMutex);
+
+        size_t available_data_in_buffer = serialMessages.length();
+        size_t remaining_file_size = filesize_s - bytesReceived;
+
+        size_t bytes_to_process = std::min(available_data_in_buffer, remaining_file_size);
+
+        if (bytes_to_process > 0) {
+            // Write the data chunk
+            outfile.write(serialMessages.data(), bytes_to_process);
+            bytesReceived += bytes_to_process;
+
+            // Remove processed data from the buffer
+            serialMessages.erase(0, bytes_to_process);
+        }
+    }
+
+    outfile.close();
+
+    // After receiving all expected bytes, consume the final END marker if present
+    {
+        std::lock_guard<std::mutex> lock(msgMutex);
+        size_t end_pos = serialMessages.find("END\r\n");
+        if (end_pos != std::string::npos) {
+            serialMessages.erase(end_pos, 5); // 5 is for "END\r\n"
+        }
+    }
+
+    if (bytesReceived == filesize_s) {
+        Log("SUCCESS: File transfer complete. Bytes received: " + std::to_string(bytesReceived) + " to " + wstring_to_string(full_path_w));
+    }
+    else {
+        Log("ERROR: File transfer incomplete. Expected " + std::to_string(filesize_s) + " bytes, got " + std::to_string(bytesReceived) + " bytes.");
+    }
+}
+
 void PicoListenerThread()
 {
     char buffer[512];
@@ -509,47 +669,26 @@ void PicoListenerThread()
     {
         bool connectedNow = false;
 
+        // --- Connection and Reconnection Logic (unchanged) ---
         {
             std::lock_guard<std::mutex> lock(serialMutex);
             if (hSerial != INVALID_HANDLE_VALUE)
             {
                 DWORD errors;
                 COMSTAT status;
-                // Check if the port is still alive/valid
-                if (ClearCommError(hSerial, &errors, &status))
-                {
-                    connectedNow = true;
-                }
-                else
-                {
-                    // Port failed, close handle
-                    CloseHandle(hSerial);
-                    hSerial = INVALID_HANDLE_VALUE;
-                }
+                if (ClearCommError(hSerial, &errors, &status)) { connectedNow = true; }
+                else { CloseHandle(hSerial); hSerial = INVALID_HANDLE_VALUE; }
             }
         }
 
-        // Handle connection state change (Disconnected -> Log)
-        if (!connectedNow && wasConnected)
-        {
-            Log("Pico disconnected on " + wstring_to_string(portToFind));
+        if (!connectedNow && wasConnected) { Log("Pico disconnected on " + wstring_to_string(portToFind)); }
+        if (!connectedNow) {
+            if (OpenSerialPort(portToFind)) { connectedNow = true; }
         }
-
-        // Attempt reconnection
-        if (!connectedNow)
-        {
-            if (OpenSerialPort(portToFind)) {
-                connectedNow = true;
-            }
-        }
-
-        // Handle connection state change (Connected -> Log)
-        if (connectedNow && !wasConnected)
-        {
-            Log("Pico connected on " + wstring_to_string(portToFind));
-        }
-
+        if (connectedNow && !wasConnected) { Log("Pico connected on " + wstring_to_string(portToFind)); }
         wasConnected = connectedNow;
+
+        bool protocolInitiatedThisCycle = false;
 
         // Read incoming data and append to shared buffer
         if (connectedNow)
@@ -561,28 +700,46 @@ void PicoListenerThread()
                 DWORD errors;
                 COMSTAT status;
 
-                // *** CRITICAL NEW STEP: Clear any communication errors immediately before reading ***
-                // This ensures pending errors (like framing/parity) don't block the ReadFile call.
                 ClearCommError(hSerial, &errors, &status);
 
-                // ReadFile will return quickly due to the immediate polling timeouts 
-                // you set in OpenSerialPort.
                 BOOL readOK = ReadFile(hSerial, buffer, sizeof(buffer), &bytesRead, NULL);
 
                 if (readOK && bytesRead > 0)
                 {
-                    // --- CRITICAL TEMPORARY DIAGNOSTIC START ---
                     std::string raw(buffer, bytesRead);
 
-                    // Log the raw received data using the main Log function
-                    Log("[RAW RECV: " + std::to_string(bytesRead) + " bytes] " + raw);
-                    // --- CRITICAL TEMPORARY DIAGNOSTIC END ---
+                    // --- SUPPRESS ACK/NACK RAW LOGGING ---
+                    bool shouldLogRaw = true;
+                    if (protocolActive.load()) {
+                        if (bytesRead == 5) {
+                            if (raw == "ACK\r\n" || raw == "NACK\r\n") {
+                                shouldLogRaw = false;
+                            }
+                        }
+                    }
+
+                    if (shouldLogRaw) {
+                        // --- CRITICAL FIX: Aggressively trim all leading/trailing whitespace/newlines ---
+                        std::string rawLog = raw;
+
+                        // Trim trailing whitespace/newlines (using std::isspace)
+                        rawLog.erase(std::find_if(rawLog.rbegin(), rawLog.rend(), [](unsigned char ch) {
+                            return !std::isspace(ch);
+                            }).base(), rawLog.end());
+
+                        // Trim leading whitespace/newlines
+                        rawLog.erase(rawLog.begin(), std::find_if(rawLog.begin(), rawLog.end(), [](unsigned char ch) {
+                            return !std::isspace(ch);
+                            }));
+
+                        // Log the cleaned string
+                        Log("[RAW RECV: " + std::to_string(bytesRead) + " bytes] " + rawLog);
+                    }
+                    // ------------------------------------
 
                     std::lock_guard<std::mutex> msgLock(msgMutex);
-                    // Append only the bytes read to the shared protocol buffer
                     serialMessages.append(buffer, bytesRead);
                 }
-                // Handle ReadFile errors that indicate a connection loss
                 else if (!readOK && GetLastError() != ERROR_IO_PENDING)
                 {
                     Log("FATAL SERIAL READ ERROR (Error: " + std::to_string(GetLastError()) + "). Forcing reconnection.");
@@ -592,12 +749,31 @@ void PicoListenerThread()
             }
         }
 
-        // --- Display the fully parsed messages in the log ---
-        // This continues to parse and log complete lines from serialMessages
-        FlushSerialMessagesToLog();
+        // --- Download Initiation Block (unchanged) ---
+        {
+            std::lock_guard<std::mutex> msgLock(msgMutex);
+            if (!protocolActive.load()) {
+                size_t send_pos = serialMessages.find("SEND ");
+                size_t eol_pos = serialMessages.find('\n', send_pos);
+                if (send_pos != std::string::npos && eol_pos != std::string::npos) {
+                    std::string command_line = serialMessages.substr(send_pos, eol_pos - send_pos + 1);
+                    serialMessages.erase(send_pos, eol_pos - send_pos + 1);
+                    Log("[PICO COMMAND] " + command_line);
+                    std::thread(HandleIncomingSend, command_line).detach();
+                    protocolInitiatedThisCycle = true;
+                }
+            }
+        }
 
+
+        if (!protocolInitiatedThisCycle) {
+            FlushSerialMessagesToLog();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
+
 
 void CreateUI(HWND hWnd)
 {
