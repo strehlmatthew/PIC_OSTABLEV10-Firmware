@@ -1,0 +1,12 @@
+# IDE/Tooling Files
+.vs/
+PICOLINKV1/.vs/
+*.ipch
+*.pch
+*.db
+*.suo
+*.user
+
+# Operating System Files
+.DS_Store
+Thumbs.db
