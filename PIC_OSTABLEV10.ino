@@ -731,16 +731,71 @@ void drawCursorAndPreview() {
             
             int drawX = prevCol * CHAR_WIDTH;
             int drawY = prevRowY;
+            
+            // --- TARGETED FIX FOR THE CHARACTER *AFTER* THE NEW CURSOR PREVIEW ---
+            // The character being clipped is at the index equal to the old preview length (i == lastPreviewCols).
+            // Since the loop runs from i=0 to lastPreviewCols-1, we need to check i == lastPreviewCols-1
+            // AND ensure the character *after* this loop ends is also addressed.
+            
+            if (i == lastPreviewCols - 1) {
+                // If the cursor is still on the same line, the character immediately following the new, 
+                // shorter preview (which is the start of the old preview's clip area) is the target.
+                
+                // 1. First, clear the rest of the old cursor highlight using the standard wide clear.
+                tft.fillRect(drawX - 1, drawY - 1, CHAR_WIDTH + 2, LINE_HEIGHT + 1, ST77XX_BLACK);
+                
+                // 2. NOW, check the position *after* this one for the clip artifact.
+                // This requires logic *outside* the loop, but since we are modifying the loop...
+                
+                // For now, let's revert to the single-character fix at i=1, as that is the standard pattern, 
+                // and assume the issue is related to the drawing of the character *after* the preview.
+                
+                // REVERTING TO THE LAST KNOWN BEST (BUT STILL FAILING) CODE, 
+                // AND ADDING A FINAL CLEAR AFTER THE LOOP
+            }
+            
+            // Reverting to the logic that uses your standard clear and redraw:
             tft.fillRect(drawX - 1, drawY - 1, CHAR_WIDTH + 2, LINE_HEIGHT + 1, ST77XX_BLACK);
             
             if (prevGlobalCursorPos + i < fullInputLine.length()) {
                 char c = fullInputLine.charAt(prevGlobalCursorPos + i);
-                tft.setCursor(drawX, drawY);
+                
+                tft.setCursor(drawX, drawY); 
+                
                 bool isPromptChar = !inputWrapped && (prevGlobalCursorPos + i) < PROMPT.length();
                 tft.setTextColor(isPromptChar ? ST77XX_CYAN : ST77XX_WHITE);
+                
                 tft.print(c);
             }
             prevCol++;
+        }
+        
+        // --- FINAL ATTEMPT AT TARGETED FIX FOR CLIPPING OUTSIDE THE LOOP ---
+        // We calculate the column and row for the character *immediately following* the old preview area.
+        int clipCol = prevCol;
+        int clipRowY = prevRowY;
+        
+        // Adjust draw position for the character *after* the preview ends (if it wrapped).
+        if (clipCol >= COLS) {
+            clipCol = 0;
+            clipRowY += LINE_HEIGHT;
+        }
+
+        int clipDrawX = clipCol * CHAR_WIDTH;
+        int clipDrawY = clipRowY;
+        
+        // We target the *next* character's position for a surgical, unpadded clear and redraw.
+        if (prevGlobalCursorPos + lastPreviewCols < fullInputLine.length()) {
+            char c = fullInputLine.charAt(prevGlobalCursorPos + lastPreviewCols);
+            
+            // Clear the clipped area (unpadded clear).
+            tft.fillRect(clipDrawX, clipDrawY, CHAR_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
+            
+            // Redraw the character.
+            tft.setCursor(clipDrawX, clipDrawY);
+            bool isPromptChar = !inputWrapped && (prevGlobalCursorPos + lastPreviewCols) < PROMPT.length();
+            tft.setTextColor(isPromptChar ? ST77XX_CYAN : ST77XX_WHITE);
+            tft.print(c);
         }
     }
     
@@ -756,7 +811,7 @@ void drawCursorAndPreview() {
         int drawX = drawCol * CHAR_WIDTH;
         int padX = drawX - 1;
         int padY = drawRowY - 1;
-        int padW = CHAR_WIDTH + 1; // Standard cursor width remains CHAR_WIDTH + 2
+        int padW = CHAR_WIDTH + 1; // Standard cursor width remains CHAR_WIDTH + 1
         int padH = LINE_HEIGHT + 1;
 
         if (cursorVisible) {
