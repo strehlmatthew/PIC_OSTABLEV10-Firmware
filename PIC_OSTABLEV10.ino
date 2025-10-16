@@ -854,7 +854,55 @@ void clearCmdBuffer() {
     inputWrapped = false; 
     drawFullTerminal();
 }
+void redrawTrailingText() {
+    // --- 1. Calculate the cursor's exact screen position (x, y) ---
+    String fullInput = String(cmdBuf).substring(0, cmdLen);
+    String segments[16];
+    int segmentCount = 0;
+    calculateFullWrapSegments(fullInput, segments, segmentCount, 16, inputWrapped);
 
+    int linesToDraw = min(segmentCount, MAX_LINES);
+    int startRow = MAX_LINES - linesToDraw;
+
+    int tempCursorPos = cursorPos;
+    int cursorSegmentIndex = -1;
+    int cursorColInSegment = 0;
+
+    for (int i = 0; i < segmentCount; ++i) {
+        if (tempCursorPos <= segments[i].length()) {
+            cursorSegmentIndex = i;
+            cursorColInSegment = tempCursorPos;
+            break;
+        }
+        tempCursorPos -= segments[i].length();
+    }
+
+    if (cursorSegmentIndex == -1) { // Failsafe
+        drawFullTerminal();
+        return;
+    }
+    
+    int promptOffset = (!inputWrapped && cursorSegmentIndex == 0) ? promptCols() : 0;
+    int cursorScreenX = (promptOffset + cursorColInSegment) * CHAR_WIDTH;
+    int cursorScreenY = (startRow + (cursorSegmentIndex - (segmentCount - linesToDraw))) * LINE_HEIGHT;
+
+    // --- 2. Clear the screen area from the cursor to the end ---
+    // Clear the rest of the current line
+    tft.fillRect(cursorScreenX, cursorScreenY, SCREEN_WIDTH - cursorScreenX, LINE_HEIGHT, ST77XX_BLACK);
+    // Clear any subsequent lines in the input area
+    for (int i = (cursorSegmentIndex - (segmentCount - linesToDraw)) + 1; i < linesToDraw; ++i) {
+        tft.fillRect(0, (startRow + i) * LINE_HEIGHT, SCREEN_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
+    }
+    
+    // --- 3. Redraw the trailing text ---
+    String trailingText = fullInput.substring(cursorPos);
+    tft.setCursor(cursorScreenX, cursorScreenY);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.print(trailingText); // Adafruit GFX will wrap this text if it's long enough
+    
+    // --- 4. Redraw the cursor preview over the new text ---
+    drawCursorAndPreview();
+}
 void insertCharAtCursor(char c) {
     if (cmdLen + 1 >= CMD_BUF) return;
     String inputBefore = String(cmdBuf).substring(0, cmdLen);
@@ -862,6 +910,7 @@ void insertCharAtCursor(char c) {
     String fwdBefore[MAX_CHUNKS];
     int fwdCountBefore = 0;
     calculateFullWrapSegments(inputBefore, fwdBefore, fwdCountBefore, MAX_CHUNKS, inputWrapped);
+
     for (int i = cmdLen; i > cursorPos; --i) cmdBuf[i] = cmdBuf[i - 1];
     cmdBuf[cursorPos] = c;
     cursorPos++; cmdLen++;
@@ -871,7 +920,8 @@ void insertCharAtCursor(char c) {
     String fwdAfter[MAX_CHUNKS];
     int fwdCountAfter = 0;
     calculateFullWrapSegments(inputAfter, fwdAfter, fwdCountAfter, MAX_CHUNKS, inputWrapped);
-    if (fwdCountAfter > 1) {
+    
+    if (fwdCountAfter > fwdCountBefore && cursorPos == cmdLen) {
         String lineToScroll = fwdAfter[0];
         if (!inputWrapped) {
             pushScrollback(PROMPT + lineToScroll); 
@@ -894,13 +944,22 @@ void insertCharAtCursor(char c) {
         return; 
     }
     
+    // --- FINAL OPTIMIZED REDRAW LOGIC ---
     if (fwdCountAfter != fwdCountBefore) {
         drawFullTerminal();
     } else {
-        drawCursorAndPreview();
+        // Fast Path Check: Line count is the same.
+        if (cursorPos == cmdLen) {
+            // OPTIMIZATION: If we are typing at the end of the line,
+            // a fast cursor-only redraw is sufficient and prevents flicker.
+            drawCursorAndPreview();
+        } else {
+            // INSERTION: If we inserted a character in the middle,
+            // the text shifted, so a full redraw of the input line is necessary.
+            drawFullTerminal();
+        }
     }
 }
-
 void insertStringAtCursor(const String& s) {
     for(int i = 0; i < s.length(); ++i) {
         insertCharAtCursor(s.charAt(i));
@@ -910,94 +969,17 @@ void insertStringAtCursor(const String& s) {
 void backspaceAtCursor() {
     // If cursor is at the beginning of the current command line
     if (cursorPos == 0) {
-        // If the command is currently wrapped (i.e., previous lines are in scrollback)
+        // If the command is currently wrapped, call the new helper function
         if (inputWrapped) {
-            if (scrollbackCount > 0) {
-                int newestIdx = (scrollbackHead + scrollbackCount - 1) % SCROLLBACK_SIZE;
-                
-                // FIX: Read the text field from the ScrollbackEntry struct
-                String lastScrollbackLine = scrollback[newestIdx].text;
-                
-                if (lastScrollbackLine.startsWith(SYS_PROMPT)) {
-                    return; // Never pull back system messages
-                }
-                
-                String scrolledText = lastScrollbackLine;
-                bool wasPromptLine = lastScrollbackLine.startsWith(PROMPT);
-                
-                if (wasPromptLine) {
-                     // If it's the prompt line, we extract only the content after the prompt
-                     scrolledText = lastScrollbackLine.substring(PROMPT.length());
-                }
-                
-                // Proceed only if we have text to pull or if it was an empty prompt line
-                if (scrolledText.length() > 0 && cmdLen + scrolledText.length() < CMD_BUF) {
-                    
-                    // *** FIX: Reset F1 on Scrollback Pull ***
-                    f1_copy_index = 0;
-                    // *** END FIX ***
-                    
-                    int totalNewLen = cmdLen + scrolledText.length();
-                    // Shift current cmdBuf right
-                    for (int i = totalNewLen; i >= scrolledText.length(); --i) {
-                        cmdBuf[i] = cmdBuf[i - scrolledText.length()];
-                    }
-                    // Prepend scrolledText
-                    for (int i = 0; i < scrolledText.length(); ++i) {
-                        cmdBuf[i] = scrolledText.charAt(i);
-                    }
-                    cmdLen = totalNewLen;
-                    cmdBuf[cmdLen] = 0;
-                    cursorPos = scrolledText.length();
-                    scrollbackCount--;
-                    
-                    // --- Logic to check/set inputWrapped ---
-                    if (wasPromptLine) {
-                         // We just pulled the prompt line, so the command is fully unwrapped.
-                         inputWrapped = false;
-                    } else {
-                         // Pulled a continuation line, re-check if the prompt line is still in scrollback.
-                         int searchIdx = scrollbackCount - 1;
-                         bool foundPrompt = false;
-                         while(searchIdx >= 0) {
-                             int idx = (scrollbackHead + searchIdx) % SCROLLBACK_SIZE;
-                             
-                             // FIX: Check the text field
-                             if(scrollback[idx].text.startsWith(PROMPT)) {
-                                 foundPrompt = true;
-                                 break;
-                             }
-                             searchIdx--;
-                         }
-                         inputWrapped = foundPrompt; 
-                    }
-
-                    drawFullTerminal();
-                    return; 
-                } else if (scrolledText.length() == 0 && wasPromptLine && cmdLen == 0) {
-                    // Special case: The command was just 'PICOS> ' with no content. 
-                    
-                    // *** FIX: Reset F1 on Empty Prompt Pull ***
-                    f1_copy_index = 0;
-                    // *** END FIX ***
-                    
-                    // We pull it back (which is nothing), but still need to clear the scrollback entry 
-                    // and set inputWrapped = false.
-                    scrollbackCount--;
-                    inputWrapped = false;
-                    drawFullTerminal();
-                    return;
-                }
-            }
+            unwrapPreviousLine();
         }
-        return;
+        return; // Exit if not wrapped and at start of line
     }
     
-    // Regular backspace logic (cursorPos > 0)
+    // --- RESTORED: Regular backspace logic (when cursorPos > 0) ---
 
-    // *** FIX: Reset F1 on Character Deletion ***
+    // Reset F1 on Character Deletion [cite: 245]
     f1_copy_index = 0; 
-    // *** END FIX ***
     
     String inputBefore = String(cmdBuf).substring(0, cmdLen);
     const int MAX_CHUNKS = 16;
@@ -1005,8 +987,11 @@ void backspaceAtCursor() {
     int fwdCountBefore = 0;
     calculateFullWrapSegments(inputBefore, fwdBefore, fwdCountBefore, MAX_CHUNKS, inputWrapped);
     
-    for (int i = cursorPos - 1; i < cmdLen - 1; ++i) cmdBuf[i] = cmdBuf[i + 1];
-    cmdLen--; cursorPos--;
+    for (int i = cursorPos - 1; i < cmdLen - 1; ++i) {
+        cmdBuf[i] = cmdBuf[i + 1];
+    }
+    cmdLen--; 
+    cursorPos--;
     cmdBuf[cmdLen] = 0;
 
     String inputAfter = String(cmdBuf).substring(0, cmdLen);
@@ -1014,18 +999,83 @@ void backspaceAtCursor() {
     int fwdCountAfter = 0;
     calculateFullWrapSegments(inputAfter, fwdAfter, fwdCountAfter, MAX_CHUNKS, inputWrapped);
     
+    if (cursorPos < cmdLen) {
+        drawFullTerminal();
+    } else {
+        // If the cursor is at the end, only a minimal redraw is needed.
+        drawCursorAndPreview();
+    }
     if (fwdCountAfter != fwdCountBefore) {
         drawFullTerminal();
     } else {
         drawCursorAndPreview();
     }
 }
+
 void clearCurrentCommand() {
     memset(cmdBuf, 0, CMD_BUF);
     cmdLen = 0; cursorPos = 0;
     inputWrapped = false;
 }
+void unwrapPreviousLine() {
+    // This is the complete unwrapping logic, copied directly from your backspaceAtCursor function.
+    if (inputWrapped && scrollbackCount > 0) {
+        int newestIdx = (scrollbackHead + scrollbackCount - 1) % SCROLLBACK_SIZE;
+        String lastScrollbackLine = scrollback[newestIdx].text;
 
+        if (lastScrollbackLine.startsWith(SYS_PROMPT)) {
+            return; // Never pull back system messages
+        }
+        
+        String scrolledText = lastScrollbackLine;
+        bool wasPromptLine = lastScrollbackLine.startsWith(PROMPT);
+        
+        if (wasPromptLine) {
+             scrolledText = lastScrollbackLine.substring(PROMPT.length());
+        }
+        
+        if (scrolledText.length() > 0 && cmdLen + scrolledText.length() < CMD_BUF) {
+            f1_copy_index = 0;
+            
+            int totalNewLen = cmdLen + scrolledText.length();
+            // Shift current cmdBuf right and prepend scrolledText
+            for (int i = totalNewLen; i >= scrolledText.length(); --i) {
+                cmdBuf[i] = cmdBuf[i - scrolledText.length()];
+            }
+            for (int i = 0; i < scrolledText.length(); ++i) {
+                cmdBuf[i] = scrolledText.charAt(i);
+            }
+            cmdLen = totalNewLen;
+            cmdBuf[cmdLen] = 0;
+            cursorPos = scrolledText.length();
+            scrollbackCount--;
+            
+            if (wasPromptLine) {
+                 inputWrapped = false;
+            } else {
+                 int searchIdx = scrollbackCount - 1;
+                 bool foundPrompt = false;
+                 while(searchIdx >= 0) {
+                     int idx = (scrollbackHead + searchIdx) % SCROLLBACK_SIZE;
+                     if(scrollback[idx].text.startsWith(PROMPT)) {
+                         foundPrompt = true;
+                         break;
+                     }
+                     searchIdx--;
+                 }
+                 inputWrapped = foundPrompt;
+            }
+            drawFullTerminal();
+            return; 
+        } else if (scrolledText.length() == 0 && wasPromptLine && cmdLen == 0) {
+            f1_copy_index = 0;
+            scrollbackCount--;
+            inputWrapped = false;
+            drawFullTerminal();
+            return;
+        }
+    }
+}
 void loadHistoryCommand(int index) {
     if (historyCount == 0 || index < 0 || index >= historyCount) {
         pushSystemMessage("Error: Invalid history index.");
@@ -1500,8 +1550,19 @@ void kbConfirm() {
             }
         } 
         else if (controlAction == "LEFT") {
-            if (cursorPos > 0) cursorPos--;
-        } 
+            // Check if the cursor is at the start of a wrapped line.
+            if (cursorPos == 0 && inputWrapped) {
+                // If so, trigger the unwrap action.
+                unwrapPreviousLine();
+                return; // Exit because unwrapPreviousLine() handles the full redraw.
+            }
+            
+            // Otherwise, perform the standard single-character left movement.
+            if (cursorPos > 0) {
+                cursorPos--;
+            }
+            // Let the function fall through to the final drawCursorAndPreview() call.
+        }
         else if (controlAction == "RIGHT") {
             if (cursorPos < cmdLen) cursorPos++;
         }
