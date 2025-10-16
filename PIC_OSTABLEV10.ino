@@ -181,7 +181,7 @@ const char* kbGetModeName() {
 
 // --------SETUP--------------
 unsigned long startMillis = 0;
-String deviceVersion = "PICOS CLI v2.16 (F-Input Preview Fix)"; // UPDATED VERSION
+String deviceVersion = "PICOS CLI v7.77"; // UPDATED VERSION
 bool cursorVisible = true;
 unsigned long lastBlink = 0;
 const unsigned long BLINK_MS = 600;
@@ -1908,26 +1908,28 @@ void executeCommandLine(const String &raw) {
     if (cmd == "help") {
         pushSystemMessage("Available commands:");
         pushScrollback("help         - Show this message.");
-        pushScrollback("clear        - Clear terminal scrollback.");
+        pushScrollback("clear        - Clear terminal history.");
         pushScrollback("calc <expr>  - Evaluate simple math.");
-        pushScrollback("pi           - Display Pi with rainbow colors."); 
+        pushScrollback("pi           - Display Rainbow Pi"); 
         pushScrollback("ls           - List files on LittleFS.");
         pushScrollback("cat <file>   - Display file content.");
-        pushScrollback("echo <text> >/>> <file>  - Write/append to file.");
+        pushScrollback("echo <text> >/>> <file> - Write file.");
         pushScrollback("rm <file>    - Delete a file.");
         pushScrollback("ver          - Display version info.");
         pushScrollback("time         - Show uptime since boot.");
         pushScrollback("fkey         - Show F-key functions.");
-        pushScrollback("send <file>  - Send file to host via serial.");
+        pushScrollback("send <file>  - Send file to PC via USB.");
         pushScrollback("format       - Format LT-FS partition.");
 
     } else if (cmd == "fkey") {
+        pushScrollback("F1: Print last command, char by char.");
         pushScrollback("--- F-Key functionality: ---");
         pushScrollback("F2: Copy last cmd up to char.");
         pushScrollback("F3: Repeat last cmd.");
         pushScrollback("F4: Delete current cmd up to char.");
         pushScrollback("F5: Recall last cmd. F6: Insert ^Z.");
-        pushScrollback("F7: Show history. F8: Cycle back history.");  
+        pushScrollback("F7: Show history.");
+        pushScrollback("F8: Cycle back history.");  
         pushScrollback("F9: Recall by history index.");      
 
     } else if (cmd == "clear") {
