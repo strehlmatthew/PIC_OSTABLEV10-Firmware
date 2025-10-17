@@ -8,18 +8,14 @@
 #define TFT_CS 17
 #define TFT_DC 16
 #define TFT_RST 20
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
-// ----------------------------
-// SCREEN CONFIG
-// ----------------------------
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 240
 #define CHAR_WIDTH 6
 #define LINE_HEIGHT 9
 #define MAX_LINES (SCREEN_HEIGHT / LINE_HEIGHT)
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 const int COLS = SCREEN_WIDTH / CHAR_WIDTH;
 const int WRAP_COLS = COLS - 1; 
-
 // ----------------------------
 // SERIAL UPLOAD PROTOCOL CONFIG
 // ----------------------------
@@ -59,75 +55,12 @@ size_t serialBlockRead(uint8_t* buffer, size_t count, unsigned long timeoutMs = 
     }
     return bytesRead;
 }
-
-
-// ----------------------------
-// SHELL PROMPT
-// ----------------------------
-const String PROMPT = "PICOS> ";
-inline int promptCols() { return PROMPT.length(); }
-
-// System message prompt and color
-const String SYS_PROMPT = "SYS> ";
-// Standard 16-bit colors
-#define ST77XX_GREEN 0x07E0
-#define ST77XX_CYAN 0x07FF // For ALPHA mode
-#define ST77XX_WHITE 0xFFFF
-#define ST77XX_BLACK 0x0000
-#define ST77XX_YELLOW 0xFFE0
-#define ST77XX_RED   0xF800 // For FUNC mode & F-INPUT AWAIT
-#define ST77XX_MAGENTA 0xF81F // For SYM mode
-#define ST77XX_DARK_ORANGE 0xFC00
-#define ST77XX_RAINBOW_ORANGE 0xFD20 
-#define ST77XX_BLUE    0x001F // Blue
-#define ST77XX_INDIGO  0x4810 // Indigo 
-#define ST77XX_VIOLET  0x8010 // Violet 
-
-// ----------------------------
-// RAINBOW COLOR ARRAY
-// ----------------------------
-const uint16_t RAINBOW_COLORS[] = {
-    ST77XX_RED,          // 1. Red
-    ST77XX_RAINBOW_ORANGE,// 2. Orange (Using the new bright orange)
-    ST77XX_YELLOW,       // 3. Yellow
-    ST77XX_GREEN,        // 4. Green
-    ST77XX_BLUE,         // 5. Blue (New True Blue)
-    ST77XX_INDIGO,       // 6. Indigo (New Indigo)
-    ST77XX_VIOLET        // 7. Violet (New Violet)
-};
-const int RAINBOW_COUNT = 7;
-
-// ----------------------------
-// SCROLLBACK DEFINITIONS (FIXED ORDER)
-// ----------------------------
-#define SCROLLBACK_SIZE 50 // MOVED UP
-
-// Maximum number of characters to store color data for per line (e.g., S> Pi = 3.14...)
-const int MAX_RAINBOW_CHARS = 30; 
-
-// Parallel array to store per-character colors for rainbow lines.
-uint16_t rainbowColors[SCROLLBACK_SIZE][MAX_RAINBOW_CHARS]; // SCROLLBACK_SIZE is now defined
-
-// Helper to cycle through the global RAINBOW_COLORS array.
-uint16_t getRainbowColor(int index) {
-    // Uses your global RAINBOW_COLORS array and RAINBOW_COUNT constant 
-    return RAINBOW_COLORS[index % RAINBOW_COUNT];
-}
-
-// Stores the rainbow data into the parallel array
-void storeRainbowData(int scrollbackIndex, const String &s) {
-    int charCount = s.length();
-    for (int i = 0; i < charCount && i < MAX_RAINBOW_CHARS; ++i) {
-        rainbowColors[scrollbackIndex][i] = getRainbowColor(i); 
-    }
-}
 // ----------------------------
 // LED CONFIGURATION
 // ----------------------------
 #define STATUS_LED_PIN 25 // <--- CHANGE THIS TO YOUR ACTUAL LED PIN
 #define LED_BLINK_DURATION_MS 50 // How long the LED stays on
 unsigned long ledBlinkEndTime = 0; // When to turn the LED off
-
 // ----------------------------
 // BUTTONS (TTP223)
 // ----------------------------
@@ -135,12 +68,10 @@ unsigned long ledBlinkEndTime = 0; // When to turn the LED off
 const int buttonPins[NUM_BUTTONS] = {2, 3, 4, 5};
 unsigned long lastPressTime[NUM_BUTTONS] = {0};
 const unsigned long pressCooldown = 200;
-
 #define IDX_PREV 0
 #define IDX_NEXT 1
 #define IDX_SELECT 2
 #define IDX_BACK 3
-
 // ----------------------------
 // Keyboard layers
 // ----------------------------
@@ -158,7 +89,6 @@ const int CTRL_COUNT = 5;
 const int FUNC_COUNT = 12;
 const double PI_VALUE = 3.14159265358979323846; // High precision PI
 int kbIndex = 0; // current character index (0 = mode label)
-
 // ----------------------------
 // F-Key Prompting States
 // ----------------------------
@@ -178,14 +108,14 @@ const char* kbGetModeName() {
     if (kmode == FUNC_VIEW) return "FUNC";
     return "MODE";
 }
-
-// --------SETUP--------------
+// ----------------------------
+// SETUP
+// ----------------------------
 unsigned long startMillis = 0;
 String deviceVersion = "PICOS CLI v7.77"; // UPDATED VERSION
 bool cursorVisible = true;
 unsigned long lastBlink = 0;
 const unsigned long BLINK_MS = 600;
-
 // ----------------------------
 // Terminal buffers
 // ----------------------------
@@ -194,7 +124,15 @@ char cmdBuf[CMD_BUF];
 int cmdLen = 0;
 int cursorPos = 0;
 bool inputWrapped = false;
-
+// ----------------------------
+// SHELL PROMPT
+// ----------------------------
+const String PROMPT = "PICOS> ";
+inline int promptCols() { return PROMPT.length(); }
+// ----------------------------
+// SCROLLBACK DEFINITIONS (FIXED ORDER)
+// ----------------------------
+#define SCROLLBACK_SIZE 50 // MOVED UP
 //Holds the text and the color for each entry
 struct ScrollbackEntry {
     String text;
@@ -209,20 +147,63 @@ String history[HISTORY_SIZE];
 int historyCount = 0;
 int historyIndex = -1; // -1 means no command is loaded from history. historyCount means "new command" state.
 int recallPos = 0;
-
+// ----------------------------
+// SHELL COLORS
+// ----------------------------
+const String SYS_PROMPT = "SYS> ";
+// Standard 16-bit colors
+#define ST77XX_GREEN 0x07E0
+#define ST77XX_CYAN 0x07FF // For ALPHA mode
+#define ST77XX_WHITE 0xFFFF
+#define ST77XX_BLACK 0x0000
+#define ST77XX_YELLOW 0xFFE0
+#define ST77XX_RED   0xF800 // For FUNC mode & F-INPUT AWAIT
+#define ST77XX_MAGENTA 0xF81F // For SYM mode
+#define ST77XX_DARK_ORANGE 0xFC00
+#define ST77XX_RAINBOW_ORANGE 0xFD20 
+#define ST77XX_BLUE    0x001F // Blue
+#define ST77XX_INDIGO  0x4810 // Indigo 
+#define ST77XX_VIOLET  0x8010 // Violet 
+// ----------------------------
+// RAINBOW TEXT COLOR ARRAY
+// ----------------------------
+const uint16_t RAINBOW_COLORS[] = {
+    ST77XX_RED,          // 1. Red
+    ST77XX_RAINBOW_ORANGE,// 2. Orange (Using the new bright orange)
+    ST77XX_YELLOW,       // 3. Yellow
+    ST77XX_GREEN,        // 4. Green
+    ST77XX_BLUE,         // 5. Blue (New True Blue)
+    ST77XX_INDIGO,       // 6. Indigo (New Indigo)
+    ST77XX_VIOLET        // 7. Violet (New Violet)
+};
+const int RAINBOW_COUNT = 7;
+// Maximum number of characters to store color data for per line (e.g., S> Pi = 3.14...)
+const int MAX_RAINBOW_CHARS = 30; 
+// Parallel array to store per-character colors for rainbow lines.
+uint16_t rainbowColors[SCROLLBACK_SIZE][MAX_RAINBOW_CHARS]; // SCROLLBACK_SIZE is now defined
+// Helper to cycle through the global RAINBOW_COLORS array.
+uint16_t getRainbowColor(int index) {
+    // Uses your global RAINBOW_COLORS array and RAINBOW_COUNT constant 
+    return RAINBOW_COLORS[index % RAINBOW_COUNT];
+}
+// Stores the rainbow data into the parallel array
+void storeRainbowData(int scrollbackIndex, const String &s) {
+    int charCount = s.length();
+    for (int i = 0; i < charCount && i < MAX_RAINBOW_CHARS; ++i) {
+        rainbowColors[scrollbackIndex][i] = getRainbowColor(i); 
+    }
+}
 // ----------------------------
 // Rendering snapshots
 // ----------------------------
 String prevVisibleLines[MAX_LINES];
 int prevVisibleCount = 0;
-
 // ----------------------------
 // Function prototypes
 // ----------------------------
 void pushScrollback(const String &s, uint16_t color = ST77XX_WHITE); // FIXED prototype
 void pushSystemMessage(const String &s);
 void drawFullTerminal();
-void renderPromptAndInput();
 void ensureCursorVisible();
 void insertCharAtCursor(char c);
 void insertStringAtCursor(const String& s);
@@ -252,7 +233,6 @@ void calculateFullWrapSegments(const String &input, String outLines[], int &coun
 const char* kbGetModeName();
 void drawMultiColorString(const String &text, int lineNum, int x_start);
 void executeCat(String filename);
-
 void wdt_disable_platform() {
     // This is the correct function call for most RP2040 cores 
     // to stop the watchdog timer gracefully.
@@ -262,8 +242,9 @@ void wdt_enable_platform() {
     // If your WDT implementation requires setup, place it here. 
     // For now, an empty function is safe to prevent immediate re-triggering issues.
 }
-
+// ----------------------------
 // Calculates the wrapped segments of the ENTIRE command buffer content.
+// ----------------------------
 void calculateFullWrapSegments(const String &input, String outLines[], int &count, int maxOut, bool startsAsContinuation) {
     count = 0;
     int pos = 0;
@@ -292,11 +273,6 @@ void calculateFullWrapSegments(const String &input, String outLines[], int &coun
         pos += len;
     }
 }
-
-// ----------------------------
-// Scrollback / push helpers
-// ----------------------------
-// The function now accepts a color argument with a default value of ST77XX_WHITE.
 // ----------------------------
 // Scrollback / push helpers
 // ----------------------------
@@ -362,21 +338,22 @@ void pushScrollback(const String &text, uint16_t color) {
             scrollback[idx].color = color;
             terminalScrollOffset = 0;
         }
-        // ------------------------------------------------------------------
-        
+
         if (next == -1) break; 
         
     } while (true);
     
     // As before, redraw is handled by the caller (e.g., executeCommandLine)
 }
-
-// System messages are now correctly pushed with RED color.
+// ----------------------------
+// System messages: GREEN SYS LABEL
+// ----------------------------
 void pushSystemMessage(const String &s) {
-    pushScrollback(SYS_PROMPT + s, ST77XX_GREEN);  // <-- CRITICAL: Set color to RED
+    pushScrollback(SYS_PROMPT + s, ST77XX_GREEN);  // <-- CRITICAL: Set color to GREEN
 }
+// ----------------------------
 // Draw only the scrollback area (top region) with bottom-up newest placement.
-// Draw only the scrollback area (top region) with bottom-up newest placement.
+// ----------------------------
 void drawScrollbackArea(int availableOutputRows) {
     if (availableOutputRows <= 0) {
         // Clear all previous lines
@@ -483,7 +460,9 @@ void drawScrollbackArea(int availableOutputRows) {
     }
     prevVisibleCount = availableOutputRows;
 }
-// Draws everything once (scrollback + input lines).
+// ----------------------------
+// DRAWFULLTERMINAL- Draws everything once (scrollback + input lines).
+// ----------------------------
 void drawFullTerminal() {
     int inputHeight = 1; 
     int availableOutputRows = MAX_LINES - inputHeight; 
@@ -521,16 +500,15 @@ void drawFullTerminal() {
 
     drawCursorAndPreview();
 }
-
-// drawCursorAndPreview() 
+// ----------------------------
+// drawCursorAndPreview()  Draws just the cursor and keyboard preview (Interaction point)
+// ----------------------------
 void drawCursorAndPreview() {
     
     // --- Constant Definitions for Drawing ---
     const int PROMPT_LEN = 7; 
     const int CURSOR_COL = PROMPT_LEN; 
-    
     int y_pos = (MAX_LINES - 1) * LINE_HEIGHT;
-    
     // ------------------------------------------------------------------
     // *** FORMAT CONFIRMATION DRAWING LOGIC (FINAL PADDING FIX) ***
     // ------------------------------------------------------------------
@@ -840,14 +818,9 @@ void drawCursorAndPreview() {
     lastCursorRowY = cursorRowY;
     lastGlobalCursorPos = globalCursorPos;
 }
-void renderPromptAndInput() {
-    drawCursorAndPreview();
-}
-
 void ensureCursorVisible() {
     drawCursorAndPreview();
 }
-
 void clearCmdBuffer() {
     memset(cmdBuf, 0, CMD_BUF);
     cmdLen = 0; cursorPos = 0;
@@ -965,7 +938,6 @@ void insertStringAtCursor(const String& s) {
         insertCharAtCursor(s.charAt(i));
     }
 }
-
 void backspaceAtCursor() {
     // If cursor is at the beginning of the current command line
     if (cursorPos == 0) {
@@ -1011,7 +983,6 @@ void backspaceAtCursor() {
         drawCursorAndPreview();
     }
 }
-
 void clearCurrentCommand() {
     memset(cmdBuf, 0, CMD_BUF);
     cmdLen = 0; cursorPos = 0;
@@ -1097,7 +1068,6 @@ void loadHistoryCommand(int index) {
     
     drawFullTerminal();
 }
-
 // Helper to load command based on historyIndex, cycling down (older)
 void historyRecallDown() {
     if (historyCount == 0) return;
@@ -1118,7 +1088,6 @@ void historyRecallDown() {
     // Load the command
     loadHistoryCommand(historyIndex % HISTORY_SIZE);
 }
-
 // Helper to load command based on historyIndex, cycling up (newer/back to blank)
 void historyRecallUp() {
     if (historyCount == 0) return;
@@ -1134,8 +1103,6 @@ void historyRecallUp() {
         drawFullTerminal(); 
     }
 }
-
-
 void addHistory(const String &line) {
     if (line.length() == 0) return;
     if (historyCount > 0 && history[(historyCount - 1) % HISTORY_SIZE] == line) return;
@@ -1144,11 +1111,9 @@ void addHistory(const String &line) {
     historyIndex = historyCount;
     lastCommand = line; // Tracks the last command for F1, F2, F3
 }
-
 // ----------------------------
 // Keyboard Handlers
 // ----------------------------
-
 void kbPrev() {
     if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
         // Use the dedicated formatIndex instead of kbIndex
@@ -1252,7 +1217,7 @@ void kbConfirm() {
     }
 
 
-// --- FIX: 1.5. Handle Format Confirmation Selection (The fixed block) ---
+    // --- FIX: 1.5. Handle Format Confirmation Selection (The fixed block) ---
     if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
         
         // 1. CAPTURE the user's choice.
@@ -1682,7 +1647,6 @@ void handleFKeyAction(int fKeyNumber) {
         drawFullTerminal(); 
     }
 }
-
 // Function to handle awaited input for F2, F4, F9
 void handleFKeyInput(char inputChar) {
     if (fkeyState == F2_AWAIT_CHAR) {
@@ -1737,7 +1701,6 @@ void handleFKeyInput(char inputChar) {
     kbIndex = 0;
     drawFullTerminal(); 
 }
-
 // ----------------------------
 // Command parsing & execution helpers
 // ----------------------------
@@ -1748,7 +1711,6 @@ String trimStr(const String &s) {
     if (j < i) return "";
     return s.substring(i, j + 1);
 }
-
 // basic arithmetic calculator
 String evalCalc(const String &expr) {
     String s = expr;
@@ -1841,7 +1803,6 @@ String evalCalc(const String &expr) {
     free(out); free(op); free(st); 
     return outstr;
 }
-
 void tokenizeLine(const String &line, String tokens[], int &count, int maxTokens) {
     count = 0;
     int current = 0;
@@ -1883,7 +1844,6 @@ void tokenizeLine(const String &line, String tokens[], int &count, int maxTokens
         }
     }
 }
-
 void executeCommandLine(const String &raw) {
     String line = trimStr(raw);
     if (line.length() == 0) {
@@ -2004,13 +1964,6 @@ void executeCommandLine(const String &raw) {
                 pushSystemMessage("Deleted " + tokens[1] + ".");
             else pushSystemMessage("Error: File not found or couldn't be deleted.");
         }
-        } else if (cmd == "rm") {
-        if (count < 2) pushSystemMessage("Usage: rm <filename>");
-        else {
-            if (removeFile(tokens[1]))
-                pushSystemMessage("Deleted " + tokens[1] + ".");
-            else pushSystemMessage("Error: File not found or couldn't be deleted.");
-        }
     } else if (cmd == "format") { 
         if (!fsReady) {
             pushSystemMessage("Error: LittleFS not available. Terminating...");
@@ -2079,7 +2032,6 @@ void executeCommandLine(const String &raw) {
     drawFullTerminal();
     clearCurrentCommand();
 }
-
 void drawMultiColorString(const String &text, int lineNum, int x_start) {
     // MAX_LINES, LINE_HEIGHT, CHAR_WIDTH, and SCREEN_WIDTH are assumed to be defined
     if (lineNum < 0 || lineNum >= MAX_LINES) return;
@@ -2108,7 +2060,6 @@ void drawMultiColorString(const String &text, int lineNum, int x_start) {
         }
     }
 }
-
 // ----------------------------
 // File System (LittleFS) Wrappers
 // ----------------------------
@@ -2127,7 +2078,6 @@ bool fsBegin() {
     }
     return true;
 }
-
 String listFiles() {
     String output = "--- Files ---";
     // FIX: LittleFS.open() for root directory must specify mode "r".
@@ -2146,7 +2096,6 @@ String listFiles() {
     if (output == "--- Files ---") return "--- No files on LittleFS ---";
     return output;
 }
-
 String readFile(const String &path) {
     if (!LittleFS.exists(path)) return "Error: File not found.";
     File file = LittleFS.open(path, "r");
@@ -2159,7 +2108,6 @@ String readFile(const String &path) {
     file.close();
     return content;
 }
-
 bool writeFile(const String &path, const String &data, bool append) {
     File file = LittleFS.open(path, append ? "a" : "w");
     if (!file) return false;
@@ -2168,7 +2116,6 @@ bool writeFile(const String &path, const String &data, bool append) {
     file.close();
     return true;
 }
-
 bool removeFile(const String &path) {
     if (!LittleFS.exists(path)) return false;
     return LittleFS.remove(path);
@@ -2215,12 +2162,10 @@ bool formatFilesystem() {
         return false;
     }
 }
-
 // NOTE: You must ensure WDT_DISABLE() and WDT_ENABLE() are defined in your sketch.
 // ----------------------------
 // FILE SENDING (PC -> PICO)
 // ----------------------------
-
 /**
  * @brief Executes the flow-controlled binary UPLOAD process from PC to Pico.
  * This function is BLOCKING for the duration of the file transfer.
@@ -2230,7 +2175,6 @@ bool formatFilesystem() {
 // ----------------------------
 // FILE SENDING (PC -> PICO) - FLOW CONTROL FIX
 // ----------------------------
-
 /**
  * @brief Executes the flow-controlled binary UPLOAD process from PC to Pico.
  * This function is BLOCKING for the duration of the file transfer.
@@ -2320,7 +2264,6 @@ void executeUpload(String filename, size_t fileSize) {
 // ----------------------------
 // FILE RECEIVING (PICO -> PC)
 // ----------------------------
-
 /**
  * @brief Reads the contents of a file and streams it to the serial port.
  * @param filename The name of the file to stream.
@@ -2374,7 +2317,6 @@ void executeCat(String filename) {
 // ----------------------------
 // Serial Command Handler (FIXED & CONSOLIDATED)
 // ----------------------------
-
 /**
  * @brief Handles incoming serial commands from a host PC.
  * * This function parses commands and delegates file transfer to blocking functions.
@@ -2470,7 +2412,6 @@ void handleSerialCommands() {
         }
     }
 }
-
 // ----------------------------
 // Setup / Loop
 // ----------------------------
@@ -2515,8 +2456,6 @@ void setup() {
     // Set initial history index to "new command" state
     historyIndex = historyCount; 
 }
-
-
 // ----------------------------
 // Main loop
 // ----------------------------
@@ -2542,7 +2481,7 @@ void loop() {
             lastPressTime[i] = now;
             switch (i) {
                 case IDX_PREV: kbPrev(); drawCursorAndPreview(); break;
-                case IDX_NEXT: kbNext(); drawCursorAndPreview(); break;
+                case IDX_NEXT: kbNext(); break;
                 case IDX_SELECT: kbConfirm(); break;
                 case IDX_BACK: backspaceAtCursor(); break;
             }
