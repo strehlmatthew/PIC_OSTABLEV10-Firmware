@@ -281,7 +281,6 @@ void calculateFullWrapSegments(const String &input, String outLines[], int &coun
 // ----------------------------
 // Scrollback / push helpers
 // ----------------------------
-// The function definition must NOT include the default argument.
 void pushScrollback(const String &text, uint16_t color) { 
     int current = 0;
     int next = -1;
@@ -468,9 +467,6 @@ void drawScrollbackArea(int availableOutputRows) {
 // ----------------------------
 // DRAWFULLTERMINAL- Draws everything once (scrollback + input lines).
 // ----------------------------
-// ----------------------------
-// DRAWFULLTERMINAL- Draws everything once (scrollback + input lines).
-// ----------------------------
 void drawFullTerminal() {
     // 1. Calculate all visual line segments from the entire command buffer.
     String input = String(cmdBuf).substring(0, cmdLen); 
@@ -492,9 +488,9 @@ void drawFullTerminal() {
     // *** MODIFICATION ***
     // Redraw the input area using the new function
     drawInputArea();
-    
-    // Finally, draw the cursor over the newly rendered text.
+
     drawCursorAndPreview();
+
 }
 // ----------------------------
 // drawInputArea() - Draws ONLY the command input area (no scrollback, no cursor)
@@ -794,6 +790,11 @@ void drawCursorAndPreview() {
         int padW = CHAR_WIDTH + 1; // Standard cursor width remains CHAR_WIDTH + 1
         int padH = LINE_HEIGHT + 1;
 
+        if (padX < 0) {
+            padX = 0;
+        }
+
+
         if (cursorVisible) {
             // Apply modeTextColor only if it is the mode label (kbIndex == 0) OR if it is F-INPUT AWAIT mode (kbIndex > 0)
             uint16_t bgColor = ST77XX_WHITE;
@@ -906,49 +907,69 @@ void redrawTrailingText() {
 void insertCharAtCursor(char c) {
     if (cmdLen + 1 >= CMD_BUF) return;
 
-    // --- 1. Get the current number of wrapped segments (lines) ---
+    // --- 1. Calculate BEFORE state ---
     const int MAX_CHUNKS = 16;
     String preSegments[MAX_CHUNKS];
     int preCount = 0;
-    // Calculate segments of the current command buffer content
     calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), preSegments, preCount, MAX_CHUNKS, false);
+    if (preCount == 0) preCount = 1; // Ensure at least one line
+
+    // Calculate cursor's visual row BEFORE insertion
+    int preCursorRow = 0;
+    const int PROMPT_LEN_INTERNAL = PROMPT.length();
+    const int LINE_1_CAPACITY = COLS - PROMPT_LEN_INTERNAL;
+    const int LINE_N_CAPACITY = WRAP_COLS;
+    int tempPrePos = cursorPos;
+    if (tempPrePos >= LINE_1_CAPACITY) {
+        tempPrePos -= LINE_1_CAPACITY;
+        preCursorRow = 1 + (tempPrePos / LINE_N_CAPACITY);
+    }
 
     // --- 2. Perform the insertion in memory ---
     for (int i = cmdLen; i > cursorPos; --i) {
         cmdBuf[i] = cmdBuf[i - 1];
     }
     cmdBuf[cursorPos] = c;
-    cursorPos++;
+    cursorPos++; // Cursor moves forward after insertion
     cmdLen++;
     cmdBuf[cmdLen] = 0;
 
-    // --- 3. Get the new number of wrapped segments (lines) ---
+    // --- 3. Calculate AFTER state ---
     String postSegments[MAX_CHUNKS];
     int postCount = 0;
-    // Calculate segments of the newly inserted command buffer content
     calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), postSegments, postCount, MAX_CHUNKS, false);
-    
-    // --- 4. HYBRID Conditional Redraw Logic ---
-    if (postCount > preCount) {
-        // A new visual line (segment) has been created (wrap).
-        // This changes the screen layout, so we MUST call drawFullTerminal().
-        
-        // This logic is from your original file to handle cursor state transfer
-        bool oldVisibility = cursorVisible;
-        cursorVisible = false; // Hide the cursor for the transfer
-        drawCursorAndPreview();
-        cursorVisible = oldVisibility;
-        
-        // Perform the full terminal redraw with the updated state.
-        drawFullTerminal();
-    } else {
-        // No line count change. Use the flicker-free method.
-        // This correctly handles text wrapping *within* the same number of lines.
-        redrawTrailingText();
-        drawCursorAndPreview();
+    if (postCount == 0) postCount = 1; // Ensure at least one line
+
+    // Calculate cursor's visual row AFTER insertion
+    int postCursorRow = 0;
+    int tempPostPos = cursorPos; // Use the updated cursorPos
+    if (tempPostPos >= LINE_1_CAPACITY) {
+        tempPostPos -= LINE_1_CAPACITY;
+        postCursorRow = 1 + (tempPostPos / LINE_N_CAPACITY);
     }
-    
-    // FIX: Reset F1 sequence when ANY normal character is inserted
+
+    // --- 4. MODIFIED Conditional Redraw Logic ---
+    if (postCount > preCount || postCursorRow > preCursorRow) {
+        // Redraw FULL terminal if:
+        // a) The total number of lines increased (layout change)
+        // OR
+        // b) The cursor wrapped down onto a new line.
+
+        // Hide cursor logic (optional but helps transition)
+        bool oldVisibility = cursorVisible;
+        cursorVisible = false;
+        drawCursorAndPreview(); // Update internal state before full redraw
+        cursorVisible = oldVisibility;
+
+        // Perform the full terminal redraw.
+        drawFullTerminal(); // This calls drawInputArea and drawCursorAndPreview internally
+    } else {
+        // No layout change AND cursor stayed on the same visual line.
+        // Use the flicker-free redrawTrailingText.
+        redrawTrailingText(); // Calls drawCursorAndPreview internally
+    }
+
+    // --- 5. Reset F1 sequence ---
     f1_copy_index = 0;
 }
 void insertStringAtCursor(const String& s) {
@@ -966,20 +987,18 @@ void backspaceAtCursor() {
     const int MAX_CHUNKS = 16;
     String preSegments[MAX_CHUNKS];
     int preCount = 0;
-    // Calculate segments of the current command buffer content
     calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), preSegments, preCount, MAX_CHUNKS, false);
 
     // --- 2. Hide cursor IMMEDIATELY before deletion begins ---
     bool oldVisibility = cursorVisible;
     cursorVisible = false;
-    // This draw call immediately renders the cursor invisible on the screen
-    drawCursorAndPreview(); 
+    drawCursorAndPreview(); // This also updates lastPreviewCols, etc.
 
     // --- 3. Perform the deletion in memory ---
     for (int i = cursorPos - 1; i < cmdLen - 1; ++i) {
         cmdBuf[i] = cmdBuf[i + 1];
     }
-    cmdLen--; 
+    cmdLen--;
     cursorPos--;
     cmdBuf[cmdLen] = 0;
 
@@ -987,24 +1006,91 @@ void backspaceAtCursor() {
     String postSegments[MAX_CHUNKS];
     int postCount = 0;
     calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), postSegments, postCount, MAX_CHUNKS, false);
-    
+    if (cmdLen > 0 && postCount == 0) postCount = 1;
+
+    // --- Flag if an un-wrap occurred ---
+    bool didUnwrap = (postCount < preCount);
+
     // --- 5. HYBRID Conditional Redraw Logic ---
-    if (postCount < preCount) {
-        // A visual line (segment) has been removed (un-wrap).
-        // The layout has changed. We MUST call drawFullTerminal()
-        // to redraw the scrollback area in its new, larger space.
-        drawFullTerminal();
-        drawInputArea();
+    if (didUnwrap) {
+        // Un-wrap occurred.
+        drawFullTerminal(); // Redraws layout, might glitch prompt.
+
+        // Surgical prompt fix
+        const int LINE_1_CAPACITY = COLS - PROMPT.length();
+        if (cursorPos < LINE_1_CAPACITY) {
+            int linesToDrawAfter = min(postCount > 0 ? postCount : 1, MAX_LINES);
+            int firstInputLineY = (MAX_LINES - linesToDrawAfter) * LINE_HEIGHT;
+
+            tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+            tft.setCursor(0, firstInputLineY);
+            tft.print(PROMPT); // Redraw full prompt
+
+            int charsToDraw = min(cmdLen, LINE_1_CAPACITY);
+            String firstLineCmd = String(cmdBuf).substring(0, charsToDraw);
+            tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+            tft.setCursor(PROMPT.length() * CHAR_WIDTH, firstInputLineY);
+            tft.print(firstLineCmd);
+
+            int endX = (PROMPT.length() + firstLineCmd.length()) * CHAR_WIDTH;
+            if (endX < SCREEN_WIDTH) {
+                 tft.fillRect(endX, firstInputLineY, SCREEN_WIDTH - endX, LINE_HEIGHT, ST77XX_BLACK);
+            }
+        }
+
     } else {
-        // No line count change. Use the flicker-free method.
-        // This calls our fixed redrawTrailingText()
+        // No un-wrap.
         redrawTrailingText();
     }
 
-    // --- 6. Restore the cursor's original blinking state ---
+    // --- 6. Restore cursor visibility ---
     cursorVisible = oldVisibility;
-    // This draw call is safe in both cases
-    drawCursorAndPreview();
+    // Draw cursor at final position (this might cause the glitch on non-prompt un-wraps).
+    drawCursorAndPreview(); // This updates lastPreviewCols for the *current* state
+
+    // --- 7. TARGETED PATCH for non-prompt lines ---
+    // Apply patch only if an un-wrap happened AND we are NOT on the first line.
+    if (didUnwrap) {
+        const int LINE_1_CAPACITY = COLS - PROMPT.length();
+        if (cursorPos >= LINE_1_CAPACITY) { // Check cursor is NOT on the first line
+
+            // Recalculate segment info
+            String segments[16];
+            int segmentCount = 0;
+            calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), segments, segmentCount, 16, false);
+            if (segmentCount == 0) segmentCount = 1;
+
+            int linesToDraw = min(segmentCount, MAX_LINES);
+            int startRow = MAX_LINES - linesToDraw;
+
+            // Find segment index cursor landed on
+            int tempCursorPos = cursorPos;
+            int currentSegmentIndex = -1;
+            for (int i = 0; i < segmentCount; ++i) {
+                 if (tempCursorPos <= segments[i].length()) {
+                     currentSegmentIndex = i;
+                     break;
+                 }
+                 tempCursorPos -= segments[i].length();
+            }
+
+            // Ensure valid segment index > 0
+            if (currentSegmentIndex > 0) {
+                int currentScreenY = (startRow + (currentSegmentIndex - (segmentCount - linesToDraw))) * LINE_HEIGHT;
+                String lineText = segments[currentSegmentIndex];
+
+                // *** CHANGE: Use PROMPT.length() + 1 for the number of chars to redraw ***
+                int charsToPatch = PROMPT.length() + 1; // Explicitly set the number of chars
+                String patchText = lineText.substring(0, min(charsToPatch, lineText.length()));
+
+                // Redraw the calculated number of characters over the glitch at x=0.
+                tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+                tft.setCursor(0, currentScreenY);
+                tft.print(patchText);
+            }
+        }
+    }
+    // --- End of targeted patches ---
 }
 void clearCurrentCommand() {
     memset(cmdBuf, 0, CMD_BUF);
