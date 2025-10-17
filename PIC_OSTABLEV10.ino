@@ -124,6 +124,10 @@ char cmdBuf[CMD_BUF];
 int cmdLen = 0;
 int cursorPos = 0;
 bool inputWrapped = false;
+int lastPreviewCols = 0;
+int lastCursorCol = -1;
+int lastCursorRowY = -1;
+int lastGlobalCursorPos = -1;
 // ----------------------------
 // SHELL PROMPT
 // ----------------------------
@@ -204,6 +208,7 @@ int prevVisibleCount = 0;
 void pushScrollback(const String &s, uint16_t color = ST77XX_WHITE); // FIXED prototype
 void pushSystemMessage(const String &s);
 void drawFullTerminal();
+void drawInputArea();
 void ensureCursorVisible();
 void insertCharAtCursor(char c);
 void insertStringAtCursor(const String& s);
@@ -463,239 +468,236 @@ void drawScrollbackArea(int availableOutputRows) {
 // ----------------------------
 // DRAWFULLTERMINAL- Draws everything once (scrollback + input lines).
 // ----------------------------
+// ----------------------------
+// DRAWFULLTERMINAL- Draws everything once (scrollback + input lines).
+// ----------------------------
 void drawFullTerminal() {
-    int inputHeight = 1; 
-    int availableOutputRows = MAX_LINES - inputHeight; 
-    if (availableOutputRows < 0) availableOutputRows = 0;
+    // 1. Calculate all visual line segments from the entire command buffer.
+    String input = String(cmdBuf).substring(0, cmdLen); 
+    const int MAX_CHUNKS = 16;
+    String fwdSegments[MAX_CHUNKS];
+    int fwdCount = 0;
+    calculateFullWrapSegments(input, fwdSegments, fwdCount, MAX_CHUNKS, false);
+    
+    if (fwdCount == 0) fwdCount = 1;
 
+    // Determine how many lines the input will occupy.
+    const int INPUT_LINES_TO_DRAW = min(fwdCount, MAX_LINES);
+    // 2. Determine screen layout, shrinking the history area to make room for the input.
+    int availableOutputRows = MAX_LINES - INPUT_LINES_TO_DRAW; 
+    
+    // Redraw the history/scrollback area in its new, possibly smaller, space.
     drawScrollbackArea(availableOutputRows);
-    int yStart = availableOutputRows * LINE_HEIGHT;
-    
-    if (yStart < SCREEN_HEIGHT)
-        tft.fillRect(0, yStart, SCREEN_WIDTH, SCREEN_HEIGHT - yStart, ST77XX_BLACK);
-    int visualRow = availableOutputRows;
-    int y = visualRow * LINE_HEIGHT;
-    tft.fillRect(0, y, SCREEN_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
-    
-    tft.setCursor(0, y);
-    int startCol = 0;
-    String input = String(cmdBuf).substring(0, cmdLen);
-    const int MAX_INPUT_CHARS = WRAP_COLS - (inputWrapped ? 0 : PROMPT.length());
-    if (!inputWrapped) {
-        tft.setTextColor(ST77XX_CYAN);
-        tft.print(PROMPT);
-        startCol = PROMPT.length();
-    }
-    
-    tft.setTextColor(ST77XX_WHITE);
-    String inputToDraw = input;
-    if (inputToDraw.length() > MAX_INPUT_CHARS) {
-        inputToDraw = inputToDraw.substring(0, MAX_INPUT_CHARS);
-    }
-    
-    tft.print(inputToDraw);
-    
-    int inputCols = startCol + inputToDraw.length();
-    tft.fillRect(inputCols * CHAR_WIDTH, y, SCREEN_WIDTH - (inputCols * CHAR_WIDTH), LINE_HEIGHT, ST77XX_BLACK);
 
+    // *** MODIFICATION ***
+    // Redraw the input area using the new function
+    drawInputArea();
+    
+    // Finally, draw the cursor over the newly rendered text.
     drawCursorAndPreview();
+}
+// ----------------------------
+// drawInputArea() - Draws ONLY the command input area (no scrollback, no cursor)
+// ----------------------------
+void drawInputArea() {
+    // 1. Calculate all visual line segments from the entire command buffer.
+    String input = String(cmdBuf).substring(0, cmdLen); 
+    const int MAX_CHUNKS = 16;
+    String fwdSegments[MAX_CHUNKS];
+    int fwdCount = 0;
+    calculateFullWrapSegments(input, fwdSegments, fwdCount, MAX_CHUNKS, false);
+    
+    if (fwdCount == 0) fwdCount = 1; // Always at least one line
+
+    // Determine how many lines the input will occupy.
+    const int INPUT_LINES_TO_DRAW = min(fwdCount, MAX_LINES);
+    // 2. Determine screen layout
+    int availableOutputRows = MAX_LINES - INPUT_LINES_TO_DRAW; 
+    
+    // 3. Clear the entire input area before redrawing.
+    int yStart = availableOutputRows * LINE_HEIGHT;
+    if (yStart < SCREEN_HEIGHT) {
+        tft.fillRect(0, yStart, SCREEN_WIDTH, SCREEN_HEIGHT - yStart, ST77XX_BLACK);
+    }
+
+    // 4. Loop to draw all *visible* segments of the command.
+    for (int i = 0; i < INPUT_LINES_TO_DRAW; ++i) {
+        int segmentIndex = fwdCount - INPUT_LINES_TO_DRAW + i; 
+        if (segmentIndex >= 0 && segmentIndex < fwdCount) {
+            int y = (availableOutputRows + i) * LINE_HEIGHT;
+            int xOffset = 0;
+            
+            if (segmentIndex == 0) {
+                tft.fillRect(0, y, promptCols() * CHAR_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
+                tft.setCursor(0, y);
+                tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+                tft.print(PROMPT);
+                xOffset = promptCols() * CHAR_WIDTH;
+            }
+            
+            tft.setCursor(xOffset, y); 
+            tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+            tft.print(fwdSegments[segmentIndex]);
+
+            int textWidth = xOffset + fwdSegments[segmentIndex].length() * CHAR_WIDTH;
+            tft.fillRect(textWidth, y, SCREEN_WIDTH - textWidth, LINE_HEIGHT, ST77XX_BLACK);
+        }
+    }
 }
 // ----------------------------
 // drawCursorAndPreview()  Draws just the cursor and keyboard preview (Interaction point)
 // ----------------------------
 void drawCursorAndPreview() {
     
-    // --- Constant Definitions for Drawing ---
-    const int PROMPT_LEN = 7; 
-    const int CURSOR_COL = PROMPT_LEN; 
-    int y_pos = (MAX_LINES - 1) * LINE_HEIGHT;
-    // ------------------------------------------------------------------
-    // *** FORMAT CONFIRMATION DRAWING LOGIC (FINAL PADDING FIX) ***
-    // ------------------------------------------------------------------
+    // --- FORMAT CONFIRMATION DRAWING LOGIC ---
     if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
-        
-        // 1. Setup Padding Variables
+        const int PROMPT_LEN = 7;
+        const int CURSOR_COL = PROMPT_LEN;
+        int y_pos = (MAX_LINES - 1) * LINE_HEIGHT;
         int drawX = CURSOR_COL * CHAR_WIDTH;
         int drawY = y_pos;
         int padX = drawX - 1;
         int padY = drawY - 1;
-        // CORRECTED: Restoring width to CHAR_WIDTH + 3 for the Y/N cursor.
-        int padW = CHAR_WIDTH + 1; 
+        int padW = CHAR_WIDTH + 1;
         int padH = LINE_HEIGHT + 1;
         
-        // 3. Determine the character and its colors
         char displayChar = ' ';
-        uint16_t fg_color = ST77XX_WHITE; 
-        uint16_t bg_color = ST77XX_BLACK; 
+        uint16_t fg_color = ST77XX_WHITE;
+        uint16_t bg_color = ST77XX_BLACK;
         
         if (formatIndex == 0) { // User selected 'Y'
             displayChar = 'Y';
             if (cursorVisible) {
-                // Cursor ON: BLACK text on Green background (Inverted)
-                fg_color = ST77XX_BLACK; 
+                fg_color = ST77XX_BLACK;
                 bg_color = ST77XX_GREEN;
             } else {
-                // Cursor OFF: Green text on Black background (Normal)
                 fg_color = ST77XX_GREEN;
                 bg_color = ST77XX_BLACK;
             }
         } else if (formatIndex == 1) { // User selected 'N'
             displayChar = 'N';
             if (cursorVisible) {
-                // Cursor ON: BLACK text on Red background (Inverted)
                 fg_color = ST77XX_BLACK;
                 bg_color = ST77XX_RED;
             } else {
-                // Cursor OFF: Red text on Black background (Normal)
                 fg_color = ST77XX_RED;
                 bg_color = ST77XX_BLACK;
             }
         }
 
-        // 4. Draw the single blinking character block
-        tft.fillRect(padX, padY, padW, padH, bg_color); // Draw the background (with 1px padding)
-
-        tft.setCursor(drawX, drawY); 
+        tft.fillRect(padX, padY, padW, padH, bg_color);
+        tft.setCursor(drawX, drawY);
         tft.setTextColor(fg_color, bg_color);
         tft.print(displayChar);
-
-        // 5. Clear the rest of the line after the cursor block
         tft.fillRect(padX + padW, padY, SCREEN_WIDTH - (padX + padW), padH, ST77XX_BLACK);
-
-        // Reset colors and exit
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); 
-        return; 
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        return;
     }
 
-    static int lastPreviewCols = 0;
-    static int lastCursorCol = -1;
-    static int lastCursorRowY = -1;
-    static int lastGlobalCursorPos = -1;
     String fullInputLine = (inputWrapped ? "" : PROMPT) + String(cmdBuf).substring(0, cmdLen);
-    
     // --- Select preview string ---
     String preview;
-    // These constants are (Number of Chars) + 1. This is now the index of the [SPACE] key.
     const int ALPHA_CASE_KEY_INDEX = (int)strlen(alphaChars) + 1;
     const int NUM_ALPHA_KEY_INDEX = (int)strlen(numberChars) + 1;
     const int SYM_ALPHA_KEY_INDEX = (int)strlen(symbolChars) + 1;
-
-    // The preview displays the selected character/key name
-    if (kbIndex == 0) {
-        preview = kbGetModeName();
-    } else if (kmode == ALPHA) {
-        if (kbIndex <= (int)strlen(alphaChars)) {
-            preview = String(alphaChars[kbIndex - 1]);
-        } 
-        // Index X + 1 is [SPACE]
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { 
-            preview = "[SPACE]"; 
-        } 
-        // Index X + 2 is [ENTER]
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { 
-            preview = "[ENTER]"; 
+    if (kbIndex == 0) { preview = kbGetModeName(); }
+    else if (kmode == ALPHA) {
+        if (kbIndex <= (int)strlen(alphaChars)) { preview = String(alphaChars[kbIndex - 1]);
         }
-        // Index X + 3 is Mode Switch ([CASE])
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { 
-            preview = "[CASE]"; 
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { preview = "[SPACE]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { preview = "[CASE]";
         }
     }
     else if (kmode == ALPHA_LOWER) {
-        if (kbIndex <= (int)strlen(alphaLowerChars)) {
-            preview = String(alphaLowerChars[kbIndex - 1]);
-        } 
-        // Index X + 1 is [SPACE]
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { 
-            preview = "[SPACE]"; 
+        if (kbIndex <= (int)strlen(alphaLowerChars)) { preview = String(alphaLowerChars[kbIndex - 1]);
         }
-        // Index X + 2 is [ENTER]
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { 
-            preview = "[ENTER]"; 
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { preview = "[SPACE]";
         }
-        // Index X + 3 is Mode Switch ([case])
-        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { 
-            preview = "[case]"; 
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { preview = "[case]";
         }
     }
     else if (kmode == NUM) {
-        if (kbIndex <= (int)strlen(numberChars)) {
-            preview = String(numberChars[kbIndex - 1]);
-        } 
-        // Index X + 1 is [SPACE]
-        else if (kbIndex == NUM_ALPHA_KEY_INDEX) { 
-            preview = "[SPACE]"; 
+        if (kbIndex <= (int)strlen(numberChars)) { preview = String(numberChars[kbIndex - 1]);
         }
-        // Index X + 2 is [ENTER]
-        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 1) { 
-            preview = "[ENTER]"; 
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX) { preview = "[SPACE]";
         }
-        // Index X + 3 is Mode Switch ([ALPHA])
-        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 2) { 
-            preview = "[ALPHA]"; 
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 2) { preview = "[ALPHA]";
         }
     }
     else if (kmode == SYM) {
-        if (kbIndex <= (int)strlen(symbolChars)) {
-            preview = String(symbolChars[kbIndex - 1]);
-        } 
-        // Index X + 1 is [SPACE]
-        else if (kbIndex == SYM_ALPHA_KEY_INDEX) { 
-            preview = "[SPACE]"; 
+        if (kbIndex <= (int)strlen(symbolChars)) { preview = String(symbolChars[kbIndex - 1]);
         }
-        // Index X + 2 is [ENTER]
-        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 1) { 
-            preview = "[ENTER]"; 
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX) { preview = "[SPACE]";
         }
-        // Index X + 3 is Mode Switch ([ALPHA])
-        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 2) { 
-            preview = "[ALPHA]"; 
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 2) { preview = "[ALPHA]";
         }
     }
     else if (kmode == CTRL) {
-        if (kbIndex <= CTRL_COUNT) {
-            preview = "[" + ctrlKeys[kbIndex - 1] + "]";
-        } else if (kbIndex == CTRL_COUNT + 1) { // FUNC key (Index 6)
-            preview = "[FUNC]";
+        if (kbIndex <= CTRL_COUNT) { preview = "[" + ctrlKeys[kbIndex - 1] + "]";
+        }
+        else if (kbIndex == CTRL_COUNT + 1) { preview = "[FUNC]";
         }
     }
     else if (kmode == FUNC_VIEW) {
-        if (kbIndex <= FUNC_COUNT) {
-            preview = "[" + funcKeys[kbIndex - 1] + "]";
+        if (kbIndex <= FUNC_COUNT) { preview = "[" + funcKeys[kbIndex - 1] + "]";
         }
     }
 
-    int inputHeight = 1;
-    int availableOutputRows = MAX_LINES - inputHeight;
-    int cursorVisualRow = availableOutputRows;
-    int cursorRowY = cursorVisualRow * LINE_HEIGHT;
-    const int PROMPT_OFFSET = inputWrapped ? 0 : PROMPT.length();
-    const int MAX_INPUT_CHARS = WRAP_COLS - PROMPT_OFFSET;
-    int visualCursorPos = min(cursorPos, MAX_INPUT_CHARS);
-    int cursorCol = PROMPT_OFFSET + visualCursorPos;
-    int globalCursorPos = PROMPT_OFFSET + visualCursorPos; 
+    // --- Multi-Line Cursor Calculation Logic ---
+    const int PROMPT_LEN_INTERNAL = PROMPT.length();
+    const int LINE_1_CAPACITY = COLS - PROMPT_LEN_INTERNAL; 
+    const int LINE_N_CAPACITY = WRAP_COLS; 
+
+    int cursorCol = 0;
+    int cursorRow = 0;
+    int tempPos = cursorPos;
+    if (tempPos < LINE_1_CAPACITY) {
+        cursorCol = PROMPT_LEN_INTERNAL + tempPos;
+        cursorRow = 0;
+    } else {
+        tempPos -= LINE_1_CAPACITY;
+        cursorRow = 1 + (tempPos / LINE_N_CAPACITY);
+        cursorCol = tempPos % LINE_N_CAPACITY;
+    }
+
+    String segments[16];
+    int segmentCount = 0;
+    calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), segments, segmentCount, 16, false);
     
+    if (segmentCount == 0) segmentCount = 1;
+
+    const int INPUT_LINES_TO_DRAW = min(segmentCount, MAX_LINES);
+    int availableOutputRows = MAX_LINES - INPUT_LINES_TO_DRAW;
+    
+    int cursorRowInInputArea = cursorRow - (segmentCount - INPUT_LINES_TO_DRAW);
+    if (cursorRowInInputArea < 0) cursorRowInInputArea = 0;
+    int cursorRowY = (availableOutputRows + cursorRowInInputArea) * LINE_HEIGHT;
+    int globalCursorPos = PROMPT_LEN_INTERNAL + cursorPos;
     int previewCols = max(1, (int)preview.length());
-    
-    // 1. Determine the color for the Mode Label (kbIndex == 0)
+    // --- Mode Text Color Logic ---
     uint16_t modeTextColor = ST77XX_WHITE;
-    // FIX: When in F-key input mode, highlight the mode name RED (instead of showing "F-INPUT")
-    if (fkeyState != F_INACTIVE) { 
-        modeTextColor = ST77XX_RED; 
-    } 
-    // Otherwise, use standard mode colors
-    else if (kmode == ALPHA || kmode == ALPHA_LOWER) {
-        modeTextColor = ST77XX_CYAN;
-    } else if (kmode == NUM) {
-        modeTextColor = ST77XX_GREEN;
-    } else if (kmode == SYM) {
-        modeTextColor = ST77XX_MAGENTA;
-    } else if (kmode == CTRL) {
-        // CTRL is now separated and remains RED
-        modeTextColor = ST77XX_DARK_ORANGE;
-    } else if (kmode == FUNC_VIEW) {
-        // FUNC_VIEW is now separated and gets DARK_ORANGE
-        modeTextColor = ST77XX_RED;
-    } 
+    if (fkeyState != F_INACTIVE) { modeTextColor = ST77XX_RED; }
+    else if (kmode == ALPHA || kmode == ALPHA_LOWER) { modeTextColor = ST77XX_CYAN;
+    }
+    else if (kmode == NUM) { modeTextColor = ST77XX_GREEN;
+    }
+    else if (kmode == SYM) { modeTextColor = ST77XX_MAGENTA;
+    }
+    else if (kmode == CTRL) { modeTextColor = ST77XX_DARK_ORANGE;
+    }
+    else if (kmode == FUNC_VIEW) { modeTextColor = ST77XX_RED;
+    }
+    
+    // --- Clear Previous Cursor Highlight and Redraw Hidden Text ---
     if (lastGlobalCursorPos >= 0) {
         int prevGlobalCursorPos = lastGlobalCursorPos;
         int prevRowY = lastCursorRowY;
@@ -834,14 +836,16 @@ void redrawTrailingText() {
     int segmentCount = 0;
     calculateFullWrapSegments(fullInput, segments, segmentCount, 16, inputWrapped);
 
+    if (segmentCount == 0) segmentCount = 1; // Failsafe for empty buffer
+
     int linesToDraw = min(segmentCount, MAX_LINES);
     int startRow = MAX_LINES - linesToDraw;
 
     int tempCursorPos = cursorPos;
     int cursorSegmentIndex = -1;
     int cursorColInSegment = 0;
-
     for (int i = 0; i < segmentCount; ++i) {
+        // Find the segment the cursor is on
         if (tempCursorPos <= segments[i].length()) {
             cursorSegmentIndex = i;
             cursorColInSegment = tempCursorPos;
@@ -851,87 +855,101 @@ void redrawTrailingText() {
     }
 
     if (cursorSegmentIndex == -1) { // Failsafe
-        drawFullTerminal();
-        return;
+        // This can happen if the buffer is empty
+        if (segmentCount > 0) {
+             cursorSegmentIndex = 0;
+        } else {
+            drawFullTerminal();
+            return;
+        }
     }
     
-    int promptOffset = (!inputWrapped && cursorSegmentIndex == 0) ? promptCols() : 0;
+    int promptOffset = (cursorSegmentIndex == 0) ? promptCols() : 0;
     int cursorScreenX = (promptOffset + cursorColInSegment) * CHAR_WIDTH;
     int cursorScreenY = (startRow + (cursorSegmentIndex - (segmentCount - linesToDraw))) * LINE_HEIGHT;
-
+    
     // --- 2. Clear the screen area from the cursor to the end ---
     // Clear the rest of the current line
     tft.fillRect(cursorScreenX, cursorScreenY, SCREEN_WIDTH - cursorScreenX, LINE_HEIGHT, ST77XX_BLACK);
-    // Clear any subsequent lines in the input area
+    // 2b. Clear any SUBSEQUENT LINES fully
     for (int i = (cursorSegmentIndex - (segmentCount - linesToDraw)) + 1; i < linesToDraw; ++i) {
         tft.fillRect(0, (startRow + i) * LINE_HEIGHT, SCREEN_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
     }
     
-    // --- 3. Redraw the trailing text ---
-    String trailingText = fullInput.substring(cursorPos);
-    tft.setCursor(cursorScreenX, cursorScreenY);
+    // --- 3. Redraw the trailing text (NEW LOGIC) ---
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.print(trailingText); // Adafruit GFX will wrap this text if it's long enough
+
+    // 3a. Print the rest of the *current* segment
+    String currentSegment = segments[cursorSegmentIndex];
+    String restOfCurrentSegment = "";
+    if (cursorColInSegment < currentSegment.length()) {
+         restOfCurrentSegment = currentSegment.substring(cursorColInSegment);
+    }
+    tft.setCursor(cursorScreenX, cursorScreenY);
+    tft.print(restOfCurrentSegment);
+
+    // 3b. Print all *subsequent* segments on new lines
+    int currentY = cursorScreenY + LINE_HEIGHT;
+    for (int i = cursorSegmentIndex + 1; i < segmentCount; ++i) {
+        // Check if this segment is actually visible on screen
+        int segmentScreenRow = (startRow + (i - (segmentCount - linesToDraw)));
+        if (segmentScreenRow >= MAX_LINES) break; // Stop if we're off-screen
+
+        tft.setCursor(0, currentY); // Subsequent lines always start at X=0
+        tft.print(segments[i]);
+        currentY += LINE_HEIGHT;
+    }
     
     // --- 4. Redraw the cursor preview over the new text ---
     drawCursorAndPreview();
 }
 void insertCharAtCursor(char c) {
     if (cmdLen + 1 >= CMD_BUF) return;
-    String inputBefore = String(cmdBuf).substring(0, cmdLen);
-    const int MAX_CHUNKS = 16;
-    String fwdBefore[MAX_CHUNKS];
-    int fwdCountBefore = 0;
-    calculateFullWrapSegments(inputBefore, fwdBefore, fwdCountBefore, MAX_CHUNKS, inputWrapped);
 
-    for (int i = cmdLen; i > cursorPos; --i) cmdBuf[i] = cmdBuf[i - 1];
+    // --- 1. Get the current number of wrapped segments (lines) ---
+    const int MAX_CHUNKS = 16;
+    String preSegments[MAX_CHUNKS];
+    int preCount = 0;
+    // Calculate segments of the current command buffer content
+    calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), preSegments, preCount, MAX_CHUNKS, false);
+
+    // --- 2. Perform the insertion in memory ---
+    for (int i = cmdLen; i > cursorPos; --i) {
+        cmdBuf[i] = cmdBuf[i - 1];
+    }
     cmdBuf[cursorPos] = c;
-    cursorPos++; cmdLen++;
+    cursorPos++;
+    cmdLen++;
     cmdBuf[cmdLen] = 0;
 
-    String inputAfter = String(cmdBuf).substring(0, cmdLen);
-    String fwdAfter[MAX_CHUNKS];
-    int fwdCountAfter = 0;
-    calculateFullWrapSegments(inputAfter, fwdAfter, fwdCountAfter, MAX_CHUNKS, inputWrapped);
+    // --- 3. Get the new number of wrapped segments (lines) ---
+    String postSegments[MAX_CHUNKS];
+    int postCount = 0;
+    // Calculate segments of the newly inserted command buffer content
+    calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), postSegments, postCount, MAX_CHUNKS, false);
     
-    if (fwdCountAfter > fwdCountBefore && cursorPos == cmdLen) {
-        String lineToScroll = fwdAfter[0];
-        if (!inputWrapped) {
-            pushScrollback(PROMPT + lineToScroll); 
-        } else {
-            pushScrollback(lineToScroll); 
-        }
+    // --- 4. HYBRID Conditional Redraw Logic ---
+    if (postCount > preCount) {
+        // A new visual line (segment) has been created (wrap).
+        // This changes the screen layout, so we MUST call drawFullTerminal().
         
-        int scrollLength = lineToScroll.length();
-        for (int i = 0; i < cmdLen - scrollLength; i++) {
-            cmdBuf[i] = cmdBuf[i + scrollLength];
-        }
-        cmdLen -= scrollLength;
-        cmdBuf[cmdLen] = 0;
+        // This logic is from your original file to handle cursor state transfer
+        bool oldVisibility = cursorVisible;
+        cursorVisible = false; // Hide the cursor for the transfer
+        drawCursorAndPreview();
+        cursorVisible = oldVisibility;
         
-        cursorPos -= scrollLength;
-        if (cursorPos < 0) cursorPos = 0; 
-        inputWrapped = true;
-        
-        drawFullTerminal();
-        return; 
-    }
-    
-    // --- FINAL OPTIMIZED REDRAW LOGIC ---
-    if (fwdCountAfter != fwdCountBefore) {
+        // Perform the full terminal redraw with the updated state.
         drawFullTerminal();
     } else {
-        // Fast Path Check: Line count is the same.
-        if (cursorPos == cmdLen) {
-            // OPTIMIZATION: If we are typing at the end of the line,
-            // a fast cursor-only redraw is sufficient and prevents flicker.
-            drawCursorAndPreview();
-        } else {
-            // INSERTION: If we inserted a character in the middle,
-            // the text shifted, so a full redraw of the input line is necessary.
-            drawFullTerminal();
-        }
+        // No line count change. Use the flicker-free method.
+        // This correctly handles text wrapping *within* the same number of lines.
+        redrawTrailingText();
+        drawCursorAndPreview();
     }
+    
+    // FIX: Reset F1 sequence when ANY normal character is inserted
+    f1_copy_index = 0;
 }
 void insertStringAtCursor(const String& s) {
     for(int i = 0; i < s.length(); ++i) {
@@ -939,26 +957,25 @@ void insertStringAtCursor(const String& s) {
     }
 }
 void backspaceAtCursor() {
-    // If cursor is at the beginning of the current command line
-    if (cursorPos == 0) {
-        // If the command is currently wrapped, call the new helper function
-        if (inputWrapped) {
-            unwrapPreviousLine();
-        }
-        return; // Exit if not wrapped and at start of line
+    // Exit if there is nothing to delete.
+    if (cursorPos == 0 || cmdLen == 0) {
+        return;
     }
-    
-    // --- RESTORED: Regular backspace logic (when cursorPos > 0) ---
 
-    // Reset F1 on Character Deletion [cite: 245]
-    f1_copy_index = 0; 
-    
-    String inputBefore = String(cmdBuf).substring(0, cmdLen);
+    // --- 1. Get the current number of wrapped segments (lines) ---
     const int MAX_CHUNKS = 16;
-    String fwdBefore[MAX_CHUNKS];
-    int fwdCountBefore = 0;
-    calculateFullWrapSegments(inputBefore, fwdBefore, fwdCountBefore, MAX_CHUNKS, inputWrapped);
-    
+    String preSegments[MAX_CHUNKS];
+    int preCount = 0;
+    // Calculate segments of the current command buffer content
+    calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), preSegments, preCount, MAX_CHUNKS, false);
+
+    // --- 2. Hide cursor IMMEDIATELY before deletion begins ---
+    bool oldVisibility = cursorVisible;
+    cursorVisible = false;
+    // This draw call immediately renders the cursor invisible on the screen
+    drawCursorAndPreview(); 
+
+    // --- 3. Perform the deletion in memory ---
     for (int i = cursorPos - 1; i < cmdLen - 1; ++i) {
         cmdBuf[i] = cmdBuf[i + 1];
     }
@@ -966,86 +983,33 @@ void backspaceAtCursor() {
     cursorPos--;
     cmdBuf[cmdLen] = 0;
 
-    String inputAfter = String(cmdBuf).substring(0, cmdLen);
-    String fwdAfter[MAX_CHUNKS];
-    int fwdCountAfter = 0;
-    calculateFullWrapSegments(inputAfter, fwdAfter, fwdCountAfter, MAX_CHUNKS, inputWrapped);
+    // --- 4. Get the new number of wrapped segments (lines) ---
+    String postSegments[MAX_CHUNKS];
+    int postCount = 0;
+    calculateFullWrapSegments(String(cmdBuf).substring(0, cmdLen), postSegments, postCount, MAX_CHUNKS, false);
     
-    if (cursorPos < cmdLen) {
+    // --- 5. HYBRID Conditional Redraw Logic ---
+    if (postCount < preCount) {
+        // A visual line (segment) has been removed (un-wrap).
+        // The layout has changed. We MUST call drawFullTerminal()
+        // to redraw the scrollback area in its new, larger space.
         drawFullTerminal();
+        drawInputArea();
     } else {
-        // If the cursor is at the end, only a minimal redraw is needed.
-        drawCursorAndPreview();
+        // No line count change. Use the flicker-free method.
+        // This calls our fixed redrawTrailingText()
+        redrawTrailingText();
     }
-    if (fwdCountAfter != fwdCountBefore) {
-        drawFullTerminal();
-    } else {
-        drawCursorAndPreview();
-    }
+
+    // --- 6. Restore the cursor's original blinking state ---
+    cursorVisible = oldVisibility;
+    // This draw call is safe in both cases
+    drawCursorAndPreview();
 }
 void clearCurrentCommand() {
     memset(cmdBuf, 0, CMD_BUF);
     cmdLen = 0; cursorPos = 0;
     inputWrapped = false;
-}
-void unwrapPreviousLine() {
-    // This is the complete unwrapping logic, copied directly from your backspaceAtCursor function.
-    if (inputWrapped && scrollbackCount > 0) {
-        int newestIdx = (scrollbackHead + scrollbackCount - 1) % SCROLLBACK_SIZE;
-        String lastScrollbackLine = scrollback[newestIdx].text;
-
-        if (lastScrollbackLine.startsWith(SYS_PROMPT)) {
-            return; // Never pull back system messages
-        }
-        
-        String scrolledText = lastScrollbackLine;
-        bool wasPromptLine = lastScrollbackLine.startsWith(PROMPT);
-        
-        if (wasPromptLine) {
-             scrolledText = lastScrollbackLine.substring(PROMPT.length());
-        }
-        
-        if (scrolledText.length() > 0 && cmdLen + scrolledText.length() < CMD_BUF) {
-            f1_copy_index = 0;
-            
-            int totalNewLen = cmdLen + scrolledText.length();
-            // Shift current cmdBuf right and prepend scrolledText
-            for (int i = totalNewLen; i >= scrolledText.length(); --i) {
-                cmdBuf[i] = cmdBuf[i - scrolledText.length()];
-            }
-            for (int i = 0; i < scrolledText.length(); ++i) {
-                cmdBuf[i] = scrolledText.charAt(i);
-            }
-            cmdLen = totalNewLen;
-            cmdBuf[cmdLen] = 0;
-            cursorPos = scrolledText.length();
-            scrollbackCount--;
-            
-            if (wasPromptLine) {
-                 inputWrapped = false;
-            } else {
-                 int searchIdx = scrollbackCount - 1;
-                 bool foundPrompt = false;
-                 while(searchIdx >= 0) {
-                     int idx = (scrollbackHead + searchIdx) % SCROLLBACK_SIZE;
-                     if(scrollback[idx].text.startsWith(PROMPT)) {
-                         foundPrompt = true;
-                         break;
-                     }
-                     searchIdx--;
-                 }
-                 inputWrapped = foundPrompt;
-            }
-            drawFullTerminal();
-            return; 
-        } else if (scrolledText.length() == 0 && wasPromptLine && cmdLen == 0) {
-            f1_copy_index = 0;
-            scrollbackCount--;
-            inputWrapped = false;
-            drawFullTerminal();
-            return;
-        }
-    }
 }
 void loadHistoryCommand(int index) {
     if (historyCount == 0 || index < 0 || index >= historyCount) {
@@ -1515,18 +1479,11 @@ void kbConfirm() {
             }
         } 
         else if (controlAction == "LEFT") {
-            // Check if the cursor is at the start of a wrapped line.
-            if (cursorPos == 0 && inputWrapped) {
-                // If so, trigger the unwrap action.
-                unwrapPreviousLine();
-                return; // Exit because unwrapPreviousLine() handles the full redraw.
-            }
-            
-            // Otherwise, perform the standard single-character left movement.
+            // New logic: function as a simple "move left one character" key.
             if (cursorPos > 0) {
                 cursorPos--;
+                drawCursorAndPreview();
             }
-            // Let the function fall through to the final drawCursorAndPreview() call.
         }
         else if (controlAction == "RIGHT") {
             if (cursorPos < cmdLen) cursorPos++;
@@ -2162,7 +2119,6 @@ bool formatFilesystem() {
         return false;
     }
 }
-// NOTE: You must ensure WDT_DISABLE() and WDT_ENABLE() are defined in your sketch.
 // ----------------------------
 // FILE SENDING (PC -> PICO)
 // ----------------------------
