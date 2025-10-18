@@ -543,7 +543,11 @@ void drawMoon(int day, int totalDays) {
     int text_x = (SCREEN_WIDTH - w) / 2;
     int text_y = cy + r + 10;
 
-    tft.fillRect(0, text_y, SCREEN_WIDTH, h + 5, ST77XX_BLACK);
+    // THE FIX: Clear only a small, centered box for the text, not the full width.
+    int clear_width = 120; // A fixed width that's large enough for "Day 30"
+    int clear_x = (SCREEN_WIDTH - clear_width) / 2;
+    tft.fillRect(clear_x, text_y, clear_width, h + 5, ST77XX_BLACK);
+    
     tft.setCursor(text_x, text_y);
     tft.print(dayText);
 
