@@ -17,6 +17,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <SetupAPI.h>
+#pragma comment(lib, "setupapi.lib")
 
 // GLOBAL SYNCHRONIZATION OBJECTS
 std::mutex serialMutex; // Protects hSerial and related serial calls (e.g., PurgeComm, ReadFile, WriteFile)
@@ -657,36 +659,92 @@ void HandleIncomingSend(const std::string& commandLine)
         Log("ERROR: File transfer incomplete. Expected " + std::to_string(filesize_s) + " bytes, got " + std::to_string(bytesReceived) + " bytes.");
     }
 }
+std::wstring FindPicoCOMPort()
+{
+    HDEVINFO hDevInfo = SetupDiGetClassDevs(NULL, L"USB", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return L"";
+    }
 
+    SP_DEVINFO_DATA devInfoData;
+    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+    DWORD i = 0;
+
+    while (SetupDiEnumDeviceInfo(hDevInfo, i++, &devInfoData))
+    {
+        wchar_t buffer[512];
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, (PBYTE)buffer, sizeof(buffer), NULL))
+        {
+            // The Pico's hardware ID is "VID_2E8A&PID_000A"
+            if (wcsstr(buffer, L"VID_2E8A&PID_000A") != NULL)
+            {
+                HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+                if (hKey != INVALID_HANDLE_VALUE)
+                {
+                    wchar_t portName[256];
+                    DWORD size = sizeof(portName);
+                    if (RegQueryValueExW(hKey, L"PortName", NULL, NULL, (LPBYTE)portName, &size) == ERROR_SUCCESS)
+                    {
+                        RegCloseKey(hKey);
+                        SetupDiDestroyDeviceInfoList(hDevInfo);
+                        return std::wstring(portName); // Found it! (e.g., L"COM3")
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+        }
+    }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return L""; // Pico not found
+}
 void PicoListenerThread()
 {
     char buffer[512];
     DWORD bytesRead;
     bool wasConnected = false;
-    const std::wstring portToFind = L"COM4"; // Constant for the target port
+    std::wstring currentPortName = L"";
 
     while (true)
     {
         bool connectedNow = false;
 
-        // --- Connection and Reconnection Logic (unchanged) ---
+        // --- Connection and Reconnection Logic (Now with Auto-Detection) ---
         {
             std::lock_guard<std::mutex> lock(serialMutex);
             if (hSerial != INVALID_HANDLE_VALUE)
             {
                 DWORD errors;
                 COMSTAT status;
-                if (ClearCommError(hSerial, &errors, &status)) { connectedNow = true; }
-                else { CloseHandle(hSerial); hSerial = INVALID_HANDLE_VALUE; }
+                if (ClearCommError(hSerial, &errors, &status)) {
+                    connectedNow = true;
+                }
+                else {
+                    CloseHandle(hSerial);
+                    hSerial = INVALID_HANDLE_VALUE;
+                }
             }
         }
 
-        if (!connectedNow && wasConnected) { Log("Pico disconnected on " + wstring_to_string(portToFind)); }
         if (!connectedNow) {
-            if (OpenSerialPort(portToFind)) { connectedNow = true; }
+            // If disconnected, try to find the Pico's COM port
+            std::wstring foundPort = FindPicoCOMPort();
+            if (!foundPort.empty()) {
+                if (OpenSerialPort(foundPort)) {
+                    connectedNow = true;
+                    if (currentPortName != foundPort) {
+                        Log("Pico detected on " + wstring_to_string(foundPort));
+                        currentPortName = foundPort;
+                    }
+                }
+            }
+            else {
+                if (!currentPortName.empty()) {
+                    Log("Pico disconnected.");
+                    currentPortName = L"";
+                }
+            }
         }
-        if (connectedNow && !wasConnected) { Log("Pico connected on " + wstring_to_string(portToFind)); }
-        wasConnected = connectedNow;
 
         bool protocolInitiatedThisCycle = false;
 
@@ -694,12 +752,10 @@ void PicoListenerThread()
         if (connectedNow)
         {
             std::lock_guard<std::mutex> lock(serialMutex);
-
             if (hSerial != INVALID_HANDLE_VALUE)
             {
                 DWORD errors;
                 COMSTAT status;
-
                 ClearCommError(hSerial, &errors, &status);
 
                 BOOL readOK = ReadFile(hSerial, buffer, sizeof(buffer), &bytesRead, NULL);
@@ -719,23 +775,15 @@ void PicoListenerThread()
                     }
 
                     if (shouldLogRaw) {
-                        // --- CRITICAL FIX: Aggressively trim all leading/trailing whitespace/newlines ---
                         std::string rawLog = raw;
-
-                        // Trim trailing whitespace/newlines (using std::isspace)
                         rawLog.erase(std::find_if(rawLog.rbegin(), rawLog.rend(), [](unsigned char ch) {
                             return !std::isspace(ch);
                             }).base(), rawLog.end());
-
-                        // Trim leading whitespace/newlines
                         rawLog.erase(rawLog.begin(), std::find_if(rawLog.begin(), rawLog.end(), [](unsigned char ch) {
                             return !std::isspace(ch);
                             }));
-
-                        // Log the cleaned string
                         Log("[RAW RECV: " + std::to_string(bytesRead) + " bytes] " + rawLog);
                     }
-                    // ------------------------------------
 
                     std::lock_guard<std::mutex> msgLock(msgMutex);
                     serialMessages.append(buffer, bytesRead);
@@ -749,7 +797,7 @@ void PicoListenerThread()
             }
         }
 
-        // --- Download Initiation Block (unchanged) ---
+        // --- Download Initiation Block ---
         {
             std::lock_guard<std::mutex> msgLock(msgMutex);
             if (!protocolActive.load()) {
@@ -765,15 +813,13 @@ void PicoListenerThread()
             }
         }
 
-
         if (!protocolInitiatedThisCycle) {
             FlushSerialMessagesToLog();
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20)); // Polling delay
     }
 }
-
 
 void CreateUI(HWND hWnd)
 {
