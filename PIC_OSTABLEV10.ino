@@ -198,6 +198,22 @@ void storeRainbowData(int scrollbackIndex, const String &s) {
     }
 }
 // ----------------------------
+// 3D CUBE DEFINITIONS
+// ----------------------------
+struct Point3D {
+    float x, y, z;
+};
+
+// FIX: Define the 2D Point struct with a constructor
+struct Point {
+    int x, y;
+    // Default constructor
+    Point() : x(0), y(0) {}
+    // Constructor with initial values
+    Point(int _x, int _y) : x(_x), y(_y) {}
+};
+
+// ----------------------------
 // Rendering snapshots
 // ----------------------------
 String prevVisibleLines[MAX_LINES];
@@ -206,6 +222,7 @@ int prevVisibleCount = 0;
 // Function prototypes
 // ----------------------------
 void pushScrollback(const String &s, uint16_t color = ST77XX_WHITE); // FIXED prototype
+void invalidateTerminalCache();
 void pushSystemMessage(const String &s);
 void drawFullTerminal();
 void drawInputArea();
@@ -238,6 +255,19 @@ void calculateFullWrapSegments(const String &input, String outLines[], int &coun
 const char* kbGetModeName();
 void drawMultiColorString(const String &text, int lineNum, int x_start);
 void executeCat(String filename);
+void drawRotatingCube(Point* projected_points, uint16_t color);
+void runCubeAnimation();
+void mood();
+void runMoonPhase();
+void drawMoon(int day, int totalDays);
+void drawStars(); // Add this prototype
+Point3D rotateX(Point3D p, float angle);
+Point3D rotateY(Point3D p, float angle);
+Point3D rotateZ(Point3D p, float angle);
+Point project(Point3D p);
+
+uint16_t hsvToRgb565(int hue, uint8_t sat, uint8_t val);
+
 void wdt_disable_platform() {
     // This is the correct function call for most RP2040 cores 
     // to stop the watchdog timer gracefully.
@@ -246,6 +276,332 @@ void wdt_disable_platform() {
 void wdt_enable_platform() {
     // If your WDT implementation requires setup, place it here. 
     // For now, an empty function is safe to prevent immediate re-triggering issues.
+}
+
+void invalidateTerminalCache() {
+    prevVisibleCount = 0;
+}
+
+void drawStars() {
+    const int numStars = 150;
+    for (int i = 0; i < numStars; i++) {
+        int x = random(SCREEN_WIDTH);
+        int y = random(SCREEN_HEIGHT);
+        // Randomly choose between white and yellow
+        uint16_t color = (random(2) == 0) ? ST77XX_WHITE : ST77XX_YELLOW;
+        tft.drawPixel(x, y, color);
+    }
+}
+
+uint16_t hsvToRgb565(int hue, uint8_t sat, uint8_t val) {
+    uint8_t r, g, b;
+    hue = hue % 360; 
+    
+    if (val == 0) {
+        r = g = b = 0;
+    } else {
+        uint8_t region = hue / 60;
+        uint8_t remainder = (hue % 60) * 255 / 60;
+
+        uint8_t p = (val * (255 - sat)) >> 8;
+        uint8_t q = (val * (255 - ((sat * remainder) >> 8))) >> 8;
+        uint8_t t = (val * (255 - ((sat * (255 - remainder)) >> 8))) >> 8;
+
+        switch (region) {
+            case 0: r = val; g = t; b = p; break;
+            case 1: r = q; g = val; b = p; break;
+            case 2: r = p; g = val; b = t; break;
+            case 3: r = p; g = q; b = val; break;
+            case 4: r = t; g = p; b = val; break;
+            default: r = val; g = p; b = q; break;
+        }
+    }
+    // Convert 8-bit R,G,B to 16-bit RGB565
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+// *** 3D CUBE IMPLEMENTATION ***
+
+Point3D rotateX(Point3D p, float angle) {
+    float rad = angle * PI / 180.0;
+    float cosA = cos(rad);
+    float sinA = sin(rad);
+    return {p.x, p.y * cosA - p.z * sinA, p.y * sinA + p.z * cosA};
+}
+
+Point3D rotateY(Point3D p, float angle) {
+    float rad = angle * PI / 180.0;
+    float cosA = cos(rad);
+    float sinA = sin(rad);
+    return {p.x * cosA + p.z * sinA, p.y, -p.x * sinA + p.z * cosA};
+}
+
+Point3D rotateZ(Point3D p, float angle) {
+    float rad = angle * PI / 180.0;
+    float cosA = cos(rad);
+    float sinA = sin(rad);
+    return {p.x * cosA - p.y * sinA, p.x * sinA + p.y * cosA, p.z};
+}
+
+// --- 3D to 2D Projection ---
+Point project(Point3D p) {
+    // Simple orthographic projection
+    return Point((int)(p.x + SCREEN_WIDTH / 2), (int)(p.y + SCREEN_HEIGHT / 2));
+}
+
+// --- Drawing the Cube ---
+void drawRotatingCube(Point* projected_points, uint16_t color) {
+    // Edges of the cube
+    int edges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0}, // Bottom face
+        {4, 5}, {5, 6}, {6, 7}, {7, 4}, // Top face
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Connecting edges
+    };
+
+    for (int i = 0; i < 12; ++i) {
+        Point p1 = projected_points[edges[i][0]];
+        Point p2 = projected_points[edges[i][1]];
+        tft.drawLine(p1.x, p1.y, p2.x, p2.y, color);
+    }
+}
+void runCubeAnimation() {
+    tft.fillScreen(ST77XX_BLACK);
+    
+    // Define the 8 vertices of the cube
+    Point3D vertices[8];
+    float size = 50.0; // Use float to avoid conversion warnings
+    vertices[0] = {-size, -size, -size};
+    vertices[1] = { size, -size, -size};
+    vertices[2] = { size,  size, -size};
+    vertices[3] = {-size,  size, -size};
+    vertices[4] = {-size, -size,  size};
+    vertices[5] = { size, -size,  size};
+    vertices[6] = { size,  size,  size};
+    vertices[7] = {-size,  size,  size};
+
+    float angleX = 0, angleY = 0, angleZ = 0;
+
+    pushSystemMessage("Starting 3D animation...");
+    delay(1000); 
+
+    tft.fillScreen(ST77XX_BLACK);
+
+    while (true) {
+        Point projected_points[8];
+
+        // --- ERASE OLD CUBE ---
+        for(int i=0; i<8; ++i) {
+            Point3D p = vertices[i];
+            p = rotateX(p, angleX);
+            p = rotateY(p, angleY);
+            p = rotateZ(p, angleZ);
+            projected_points[i] = project(p);
+        }
+        drawRotatingCube(projected_points, ST77XX_BLACK);
+
+        // --- UPDATE ANGLES ---
+        angleX += 1.0;
+        angleY += 1.5;
+        angleZ += 2.0;
+
+        // --- DRAW NEW CUBE ---
+        for(int i=0; i<8; ++i) {
+            Point3D p = vertices[i];
+            p = rotateX(p, angleX);
+            p = rotateY(p, angleY);
+            p = rotateZ(p, angleZ);
+            projected_points[i] = project(p);
+        }
+        drawRotatingCube(projected_points, ST77XX_GREEN);
+        
+        // --- CHECK FOR EXIT ---
+        if (digitalRead(buttonPins[IDX_BACK]) == HIGH) {
+            pushSystemMessage("Exiting 3D animation...");
+            break;
+        }
+
+        delay(15); // Animation speed
+    }
+    
+    // --- RESTORE TERMINAL ---
+    
+    tft.fillScreen(ST77XX_BLACK);
+    invalidateTerminalCache();
+    drawFullTerminal();
+}
+void mood() {
+    tft.fillScreen(ST77XX_BLACK);
+    pushSystemMessage("Starting mood light!");
+    drawFullTerminal();
+    delay(1500); 
+    
+    float currentHue = 0.0; // Use a float for the hue
+    int lastHueInt = -1;
+
+    // This loop runs indefinitely until the BACK button is pressed.
+    while (true) {
+        // Check for the exit condition first.
+        if (digitalRead(buttonPins[IDX_BACK]) == HIGH) {
+            pushSystemMessage("Exiting mood light...");
+            break; // Exit the infinite loop.
+        }
+
+        // Increment the hue by a small fractional amount for a smooth transition.
+        currentHue += 0.5; 
+        if (currentHue >= 360.0) {
+            currentHue -= 360.0; // Wrap the hue value back to 0.
+        }
+
+        // Convert the float hue to an integer for comparison and color calculation.
+        int currentHueInt = (int)currentHue;
+
+        // Only redraw the screen if the integer part of the hue has changed.
+        // This is an optimization to avoid unnecessary screen fills.
+        if (currentHueInt != lastHueInt) {
+            uint16_t color = hsvToRgb565(currentHueInt, 255, 255);
+            tft.fillScreen(color);
+            lastHueInt = currentHueInt;
+        }
+        
+        delay(5); // A small delay to control the speed of the cycle.
+    }
+
+    // Restore the terminal interface.
+    tft.fillScreen(ST77XX_BLACK);
+    invalidateTerminalCache(); // Clear the visual cache
+    drawFullTerminal();        // Force a full redraw of the terminal
+}
+/**
+ * @brief Draws the moon phase for a given day using an overlapping circle approximation.
+ * @param day The current day of the lunar cycle (0-29).
+ * @param totalDays The total number of days in the cycle (e.g., 30).
+ */
+/**
+ * @brief Draws the moon phase for a given day using an overlapping circle approximation.
+ * @param day The current day of the lunar cycle (0-29).
+ * @param totalDays The total number of days in the cycle (e.g., 30).
+ */
+void drawMoon(int day, int totalDays) {
+    int cx = SCREEN_WIDTH / 2;
+    int cy = SCREEN_HEIGHT / 2 - 20; // Move moon up to make space for text
+    int r = 60;
+
+    // Clear the drawing area to erase the previous frame.
+    tft.fillRect(cx - r - 1, cy - r - 1, 2 * r + 2, 2 * r + 2, ST77XX_BLACK);
+
+    // Calculate phase and shadow position.
+    float phase = day / (float)(totalDays - 1);
+    int terminator_x = cx - (2 * r) + (int)(phase * 4.0 * r);
+
+    // --- Build the moon scanline by scanline with corrected logic ---
+    for (int y = cy - r; y <= cy + r; y++) {
+        int dy = y - cy;
+
+        // Calculate the boundaries of the full moon shape for this line.
+        int half_width_moon = round(sqrt(r * r - dy * dy));
+        int moon_x1 = cx - half_width_moon;
+        int moon_x2 = cx + half_width_moon;
+
+        // Calculate the boundaries of the shadow shape for this line.
+        int half_width_shadow = 0;
+        if (abs(dy) < r) {
+             half_width_shadow = round(sqrt(r * r - dy * dy));
+        }
+        int shadow_x1 = terminator_x - half_width_shadow;
+        int shadow_x2 = terminator_x + half_width_shadow;
+        
+        // Find the actual start and end of the shadow's intersection with the moon.
+        int intersection_start = max(moon_x1, shadow_x1);
+        int intersection_end   = min(moon_x2, shadow_x2);
+
+        // --- NEW, ROBUST LOGIC ---
+        // First, check if there is any real overlap on this line.
+        if (intersection_start >= intersection_end) {
+            // NO OVERLAP: The shadow is not on the moon here. Draw the full moon slice.
+            tft.drawFastHLine(moon_x1, y, moon_x2 - moon_x1, ST77XX_WHITE);
+        } else {
+            // OVERLAP EXISTS: "Punch out" the shadow by drawing the lit parts around it.
+            // 1. Draw the lit part to the LEFT of the shadow intersection.
+            if (moon_x1 < intersection_start) {
+                tft.drawFastHLine(moon_x1, y, intersection_start - moon_x1, ST77XX_WHITE);
+            }
+            // 2. Draw the lit part to the RIGHT of the shadow intersection.
+            if (intersection_end < moon_x2) {
+                tft.drawFastHLine(intersection_end, y, moon_x2 - intersection_end, ST77XX_WHITE);
+            }
+        }
+    }
+
+    // --- Draw the day number underneath ---
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    String dayText = "Day " + String(day + 1);
+    
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(dayText, 0, 0, &x1, &y1, &w, &h);
+    int text_x = (SCREEN_WIDTH - w) / 2;
+    int text_y = cy + r + 10;
+
+    tft.fillRect(0, text_y, SCREEN_WIDTH, h + 5, ST77XX_BLACK);
+    tft.setCursor(text_x, text_y);
+    tft.print(dayText);
+
+    tft.setTextSize(1);
+}
+/**
+ * @brief Enters a dedicated loop to display and control the moon phase viewer.
+ * Exits when the BACK button is pressed.
+ */
+void runMoonPhase() {
+    int currentDay = 0; // Start at Day 0 (New Moon)
+    const int totalDays = 30;
+
+    tft.fillScreen(ST77XX_BLACK);
+    drawStars(); // Draw the starfield background once
+    drawMoon(currentDay, totalDays);
+
+    while (true) {
+        unsigned long now = millis();
+        bool dayChanged = false;
+
+        // Check for LEFT button (IDX_PREV)
+        if (digitalRead(buttonPins[IDX_PREV]) == HIGH && (now - lastPressTime[IDX_PREV] > pressCooldown)) {
+            lastPressTime[IDX_PREV] = now;
+            currentDay--;
+            if (currentDay < 0) {
+                currentDay = totalDays - 1; // Wrap around
+            }
+            dayChanged = true;
+        }
+
+        // Check for RIGHT button (IDX_NEXT)
+        if (digitalRead(buttonPins[IDX_NEXT]) == HIGH && (now - lastPressTime[IDX_NEXT] > pressCooldown)) {
+            lastPressTime[IDX_NEXT] = now;
+            currentDay++;
+            if (currentDay >= totalDays) {
+                currentDay = 0; // Wrap around
+            }
+            dayChanged = true;
+        }
+
+        // Check for BACK button to exit
+        if (digitalRead(buttonPins[IDX_BACK]) == HIGH && (now - lastPressTime[IDX_BACK] > pressCooldown)) {
+            lastPressTime[IDX_BACK] = now;
+            break; // Exit the loop
+        }
+
+        if (dayChanged) {
+            drawMoon(currentDay, totalDays);
+        }
+
+        yield(); // Allow other processes to run
+    }
+
+    // Restore terminal interface upon exit
+    tft.fillScreen(ST77XX_BLACK);
+    invalidateTerminalCache();
+    drawFullTerminal();
 }
 // ----------------------------
 // Calculates the wrapped segments of the ENTIRE command buffer content.
@@ -1923,7 +2279,9 @@ void executeCommandLine(const String &raw) {
         pushScrollback("fkey         - Show F-key functions.");
         pushScrollback("send <file>  - Send file to PC via USB.");
         pushScrollback("format       - Format LT-FS partition.");
-
+        pushScrollback("cube         - 3D CUBE, back to exit.");
+        pushScrollback("mood         - Cycle through RGB colors.");
+        pushScrollback("moon         - Moon phases.");
     } else if (cmd == "fkey") {
         pushScrollback("F1: Print last command, char by char.");
         pushScrollback("--- F-Key functionality: ---");
@@ -1938,7 +2296,15 @@ void executeCommandLine(const String &raw) {
     } else if (cmd == "clear") {
         scrollbackCount = 0; 
         scrollbackHead = 0;
-
+    } else if (cmd == "cube") {
+        runCubeAnimation();
+        return;
+    } else if (cmd == "mood") {
+        mood();
+        return;
+    } else if (cmd == "moon") { 
+        runMoonPhase();
+        return;
     } else if (cmd == "ver") {
         pushSystemMessage(deviceVersion);
 
@@ -2462,6 +2828,7 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     handleSerialCommands(); 
+    randomSeed(analogRead(0)); // Add this line
     // TFT initialization
     tft.init(240, 240); 
     tft.setRotation(2); // Adjust as needed for your screen orientation
