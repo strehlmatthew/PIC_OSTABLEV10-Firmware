@@ -261,6 +261,9 @@ void mood();
 void runMoonPhase();
 void drawMoon(int day, int totalDays);
 void drawStars(); // Add this prototype
+void displayImage(const String& filename);
+uint16_t read16(File &f);
+uint32_t read32(File &f);
 Point3D rotateX(Point3D p, float angle);
 Point3D rotateY(Point3D p, float angle);
 Point3D rotateZ(Point3D p, float angle);
@@ -281,7 +284,27 @@ void wdt_enable_platform() {
 void invalidateTerminalCache() {
     prevVisibleCount = 0;
 }
+// Helper function to read a 16-bit value from a file (BMP uses little-endian)
+uint16_t read16(File &f) {
+  uint16_t result;
+  uint8_t buffer[2];
+  if (f.read(buffer, 2) == 2) {
+    result = buffer[0] | (buffer[1] << 8);
+    return result;
+  }
+  return 0; // Error case
+}
 
+// Helper function to read a 32-bit value from a file (BMP uses little-endian)
+uint32_t read32(File &f) {
+  uint32_t result;
+  uint8_t buffer[4];
+  if (f.read(buffer, 4) == 4) {
+    result = buffer[0] | (buffer[1] << 8) | (buffer[2] << 16) | (buffer[3] << 24);
+    return result;
+  }
+  return 0; // Error case
+}
 void drawStars() {
     const int numStars = 150;
     for (int i = 0; i < numStars; i++) {
@@ -471,16 +494,7 @@ void mood() {
     invalidateTerminalCache(); // Clear the visual cache
     drawFullTerminal();        // Force a full redraw of the terminal
 }
-/**
- * @brief Draws the moon phase for a given day using an overlapping circle approximation.
- * @param day The current day of the lunar cycle (0-29).
- * @param totalDays The total number of days in the cycle (e.g., 30).
- */
-/**
- * @brief Draws the moon phase for a given day using an overlapping circle approximation.
- * @param day The current day of the lunar cycle (0-29).
- * @param totalDays The total number of days in the cycle (e.g., 30).
- */
+
 void drawMoon(int day, int totalDays) {
     int cx = SCREEN_WIDTH / 2;
     int cy = SCREEN_HEIGHT / 2 - 20; // Move moon up to make space for text
@@ -606,6 +620,123 @@ void runMoonPhase() {
     tft.fillScreen(ST77XX_BLACK);
     invalidateTerminalCache();
     drawFullTerminal();
+}
+void displayImage(const String& filename) {
+    File bmpFile;
+    int bmpWidth, bmpHeight;             // Full W+H of BMP in pixels
+    uint8_t bmpDepth;                    // Bit depth (supports 24)
+    uint32_t bmpImageoffset;             // Start of image data in file
+    // Buffer needs to hold up to SCREEN_WIDTH pixels (3 bytes each for 24-bit)
+    uint8_t rowBuffer[SCREEN_WIDTH * 3];
+    // Screen buffer holds one row in 16-bit format
+    uint16_t screenBuffer[SCREEN_WIDTH];
+
+    bmpFile = LittleFS.open(filename, "r");
+    if (!bmpFile) {
+        pushSystemMessage("Error opening file: " + filename);
+        drawFullTerminal();
+        clearCurrentCommand();
+        return;
+    }
+
+    // --- BMP Header Parsing (mostly unchanged) ---
+    if (read16(bmpFile) != 0x4D42) { /* ... error handling ... */ return; }
+    read32(bmpFile); // filesize
+    read32(bmpFile); // reserved
+    bmpImageoffset = read32(bmpFile); // pixel data offset
+    read32(bmpFile); // DIB header size
+    bmpWidth = read32(bmpFile);
+    bmpHeight = read32(bmpFile);
+    if (read16(bmpFile) != 1) { /* ... error handling ... */ return; } // planes
+    bmpDepth = read16(bmpFile); // bits per pixel
+    if ((bmpDepth != 24) || (read32(bmpFile) != 0)) { /* ... error handling ... */ return; } // uncompressed
+
+    // BMP rows padded to 4-byte boundary
+    uint32_t rowSize = (bmpWidth * 3 + 3) & ~3;
+
+    // --- Clipping & Centering Calculations ---
+    int drawWidth = min(bmpWidth, SCREEN_WIDTH);
+    int drawHeight = min(bmpHeight, SCREEN_HEIGHT);
+
+    // Calculate starting X pixel offset within the BMP data
+    int bmpXOffset = 0;
+    if (bmpWidth > SCREEN_WIDTH) {
+        bmpXOffset = (bmpWidth - SCREEN_WIDTH) / 2;
+    }
+    // Calculate starting Y row within the BMP data (remember BMP is bottom-up)
+    int bmpYStartRow = 0;
+    if (bmpHeight > SCREEN_HEIGHT) {
+        bmpYStartRow = (bmpHeight - SCREEN_HEIGHT) / 2;
+    }
+    // Calculate the ending Y row within the BMP data
+    int bmpYEndRow = bmpYStartRow + drawHeight;
+
+    // Calculate where to start drawing on the screen (centering the *clipped* image)
+    int screenXStart = (SCREEN_WIDTH - drawWidth) / 2;
+    int screenYStart = (SCREEN_HEIGHT - drawHeight) / 2;
+
+
+    // --- Drawing Logic ---
+    tft.fillScreen(ST77XX_BLACK); // Clear screen
+
+    // Loop through the visible rows of the BMP (bottom-up)
+    for (int bmpRow = bmpYStartRow; bmpRow < bmpYEndRow; bmpRow++) {
+        // Calculate the file offset for the start of the desired *section* of the BMP row
+        uint32_t filePos = bmpImageoffset + (bmpHeight - 1 - bmpRow) * rowSize + bmpXOffset * 3;
+        bmpFile.seek(filePos);
+
+        // Read only the necessary pixel data for the visible width
+        if (bmpFile.read(rowBuffer, drawWidth * 3) != drawWidth * 3) {
+             pushSystemMessage("Error: File read failed.");
+             break; // Exit drawing loop
+        }
+
+        // Convert 24-bit BGR to 16-bit RGB565 for the screen buffer
+        int bufIdx = 0;
+        for (int col = 0; col < drawWidth; col++) {
+            uint8_t b = rowBuffer[bufIdx++];
+            uint8_t g = rowBuffer[bufIdx++];
+            uint8_t r = rowBuffer[bufIdx++];
+            screenBuffer[col] = tft.color565(r, g, b);
+        }
+
+        // Calculate the screen Y coordinate for this row
+        // (bmpRow - bmpYStartRow) gives the row index within the clipped area (0 to drawHeight-1)
+        int screenY = screenYStart + (bmpRow - bmpYStartRow);
+
+        // Draw the row buffer to the screen at the calculated position
+        tft.drawRGBBitmap(screenXStart, screenY, screenBuffer, drawWidth, 1);
+        yield(); // Allow background tasks
+    }
+
+    bmpFile.close();
+
+    // === Wait for BACK button press (unchanged) ===
+    pushSystemMessage("Press BACK to exit image viewer...");
+    // --- FIXED Wait for BACK Button Press ---
+    unsigned long timeButtonLastChecked = millis(); // Use a separate timer for polling
+    bool backButtonPressed = false;
+
+    while (!backButtonPressed) {
+        // Check button state periodically
+        if (millis() - timeButtonLastChecked > 50) { // Check every 50ms (adjust if needed)
+            if (digitalRead(buttonPins[IDX_BACK]) == HIGH) {
+                // Button is pressed, now wait for release (simple debounce)
+                delay(pressCooldown); // Wait for debounce period
+                // Optional: Check if still pressed after delay to confirm,
+                // but for exiting, just detecting the initial press is usually fine.
+                backButtonPressed = true; // Set flag to exit loop
+            }
+            timeButtonLastChecked = millis(); // Reset polling timer
+        }
+        yield(); // IMPORTANT: Keep yielding in the wait loop
+    }
+
+    // === Restore Terminal (unchanged) ===
+    tft.fillScreen(ST77XX_BLACK);
+    invalidateTerminalCache();
+    drawFullTerminal();
+    clearCurrentCommand();
 }
 // ----------------------------
 // Calculates the wrapped segments of the ENTIRE command buffer content.
@@ -2115,95 +2246,143 @@ String trimStr(const String &s) {
     return s.substring(i, j + 1);
 }
 // basic arithmetic calculator
+// arithmetic calculator with ALL fixed-size stacks/queues
+// arithmetic calculator with fixed stacks, char op stack, char operator in Tok
 String evalCalc(const String &expr) {
     String s = expr;
     String t = "";
+    // Remove spaces
     for (unsigned int i = 0; i < s.length(); ++i) if (s[i] != ' ') t += s[i];
     s = t;
 
-    struct Tok { String v; char type; };
-    Tok *out = nullptr; int out_sz = 0;
-    String *op = nullptr; int op_sz = 0;
+    // --- Fixed-size structures ---
+    const int MAX_TOKENS_OUT = 32;
+    const int MAX_OPS_STACK = 16;
+    const int MAX_EVAL_STACK = 16;
 
-    auto push_out = [&](Tok tk) { out = (Tok*)realloc(out, sizeof(Tok)*(out_sz+1));
-        out[out_sz++] = tk; };
-    auto push_op = [&](const String &o) { op = (String*)realloc(op, sizeof(String)*(op_sz+1)); op[op_sz++] = o; };
-    auto pop_op = [&]()->String { String r = op[op_sz-1]; op_sz--; op = (String*)realloc(op, sizeof(String)*max(0,op_sz)); return r; };
-    
-    // FIX 1: Corrected typo: c=='*'||c=='/'
-    auto isOp = [&](char c){ return c=='+'||c=='-'||c=='*'||c=='/'; }; 
-    auto prec = [&](char c)->int { if (c=='+'||c=='-') return 1;
-        if (c=='*'||c=='/') return 2; return 0; };
+    // *** Modified Tok struct ***
+    struct Tok {
+        String v; // Only used for numbers ('n') now
+        char type; // 'n' or 'o'
+        char op_char; // Stores the operator directly if type is 'o'
+    };
 
+    Tok out[MAX_TOKENS_OUT]; int out_sz = 0;
+    char op[MAX_OPS_STACK]; int op_sz = 0; // Operator stack remains char
+    double st[MAX_EVAL_STACK]; int st_sz = 0;
+
+    // --- Helper lambdas ---
+    auto push_out = [&](Tok tk) {
+        if (out_sz >= MAX_TOKENS_OUT) return false;
+        out[out_sz++] = tk;
+        return true;
+    };
+    auto push_op = [&](char o) {
+        if (op_sz >= MAX_OPS_STACK) return false;
+        op[op_sz++] = o;
+        return true;
+    };
+    auto pop_op = [&]()->char {
+        if (op_sz == 0) return '\0';
+        return op[--op_sz];
+    };
+
+    auto isOp = [&](char c){ return c=='+'||c=='-'||c=='*'||c=='/'; };
+    auto prec = [&](char c)->int { if (c=='+'||c=='-') return 1; if (c=='*'||c=='/') return 2; return 0; };
+
+    // --- Shunting-Yard Algorithm ---
     for (unsigned int i = 0; i < s.length();) {
         char c = s[i];
-        if ((c >= '0' && c <= '9') || c=='.') {
+        if ((c >= '0' && c <= '9') || c=='.') { // Number
             String num="";
             while (i<s.length() && ((s[i]>='0'&&s[i]<='9') || s[i]=='.')) { num+=s[i]; i++; }
-            push_out({num, 'n'});
-        } else if (isOp(c)) {
-            String opch(1,c);
-            while (op_sz && isOp(op[op_sz-1][0]) && prec(op[op_sz-1][0]) >= prec(c)) {
-                String pop = pop_op();
-                push_out({pop,'o'});
+            // Store number in v, type 'n', op_char irrelevant
+            Tok num_token = {num, 'n', '\0'};
+            if (!push_out(num_token)) return "ERR: Expression Too Complex (Output)";
+        } else if (isOp(c)) { // Operator
+            char opch = c;
+            while (op_sz > 0 && op[op_sz-1] != '(' && prec(op[op_sz-1]) >= prec(opch)) {
+                 char popped_op_char = pop_op();
+                 if (popped_op_char == '\0') return "ERR: Syntax (Pop Op)";
+                 // *** Store operator char in op_char, type 'o', v irrelevant ***
+                 Tok operator_token = {"", 'o', popped_op_char};
+                 if (!push_out(operator_token)) return "ERR: Expression Too Complex (Output)";
             }
-            push_op(opch);
+            if (!push_op(opch)) return "ERR: Expression Too Complex (Operator Stack)";
             i++;
-        } else if (c=='(') { push_op(String("(")); i++; }
-        else if (c==')') {
+        } else if (c=='(') { // Left parenthesis
+            if (!push_op('(')) return "ERR: Expression Too Complex (Operator Stack)";
+            i++;
+        } else if (c==')') { // Right parenthesis
             bool found=false;
-            while (op_sz) {
-                String top = pop_op();
-                if (top=="(") { found=true; break; }
-               
-                push_out({top,'o'});
+            while (op_sz > 0) {
+                char top_char = pop_op();
+                if (top_char == '\0') return "ERR: Syntax (Pop Op)";
+                if (top_char == '(') { found=true; break; }
+                 // *** Store operator char in op_char, type 'o', v irrelevant ***
+                 Tok operator_token = {"", 'o', top_char};
+                if (!push_out(operator_token)) return "ERR: Expression Too Complex (Output)";
             }
-            if (!found) { free(out); free(op); return "ERR"; }
+            if (!found) return "ERR: Mismatched Parentheses";
             i++;
-        } else return "ERR";
+        } else { // Invalid character
+             return "ERR: Invalid Character";
+        }
     }
-    
-    // FIX 2: Missing closing brace for the 'for' loop (Shunting-Yard)
-    while (op_sz) {
-        String top = pop_op();
-        if (top=="("||top==")") { free(out); free(op); return "ERR"; }
-        push_out({top,'o'});
-    }
-    
-    double *st = nullptr; int st_sz = 0;
-    auto push_st = [&](double v){ st = (double*)realloc(st, sizeof(double)*(st_sz+1)); st[st_sz++]=v; };
-    auto pop_st = [&]()->double{ double v = st[st_sz-1]; st_sz--; st=(double*)realloc(st,sizeof(double)*max(0,st_sz)); return v; };
 
+    while (op_sz > 0) { // Pop remaining operators
+        char top_char = pop_op();
+        if (top_char == '\0') return "ERR: Syntax (Pop Op)";
+        if (top_char == '(' || top_char == ')') return "ERR: Mismatched Parentheses";
+         // *** Store operator char in op_char, type 'o', v irrelevant ***
+         Tok operator_token = {"", 'o', top_char};
+        if (!push_out(operator_token)) return "ERR: Expression Too Complex (Output)";
+    }
+
+    // --- RPN Evaluation ---
+    st_sz = 0;
     for (int i = 0; i < out_sz; ++i) {
-        Tok &tk = out[i]; 
-        if (tk.type=='n') push_st(atof(tk.v.c_str())); 
-        else if (tk.type=='o') { 
-            if (st_sz < 2) { free(out); free(op); free(st); return "ERR"; } 
-            double b = pop_st(); 
-            double a = pop_st(); 
-            char opch = tk.v[0]; 
-            double res = 0; 
-            if (opch=='+') res = a + b; 
-            else if (opch=='-') res = a - b; 
+        Tok &tk = out[i];
+        if (tk.type=='n') { // Number
+            if (st_sz >= MAX_EVAL_STACK) return "ERR: Evaluation Stack Overflow";
+            st[st_sz] = atof(tk.v.c_str()); // Get number from v
+            st_sz++;
+        } else if (tk.type=='o') { // Operator
+            if (st_sz < 2) return "ERR: Syntax (Eval Stack Underflow)";
+            st_sz--; double b = st[st_sz];
+            st_sz--; double a = st[st_sz];
+
+            // *** Get operator directly from op_char ***
+            char opch = tk.op_char;
+            double res = 0;
+            if (opch=='+') res = a + b;
+            else if (opch=='-') res = a - b;
             else if (opch=='*') res = a * b;
-            else if (opch=='/') { 
-                if (b == 0) { free(out); free(op); free(st); return "INF"; } 
+            else if (opch=='/') {
+                if (b == 0.0) return "INF";
                 res = a / b;
-            } 
-            push_st(res); 
-        } 
-    } 
-    
-    if (st_sz != 1) { free(out); free(op); free(st); return "ERR"; } 
+            } else {
+                 // Check if op_char is somehow null/invalid
+                 if (opch == '\0') return "ERR: Internal Null Operator";
+                 else return "ERR: Unknown Operator"; // Should not happen
+            }
+            st[st_sz] = res;
+            st_sz++;
+        }
+    }
+
+    // --- Final Result ---
+    if (st_sz != 1) return "ERR: Syntax (Final Eval Stack)";
+
+    // Format result
     char buf[64];
-    dtostrf(st[0], 0, 6, buf); 
-    String outstr = String(buf); 
-    while (outstr.length()>1 && outstr.indexOf('.')>=0 && (outstr.endsWith("0") || outstr.endsWith("."))) { 
+    dtostrf(st[0], 0, 6, buf);
+    String outstr = String(buf);
+    while (outstr.length()>1 && outstr.indexOf('.')>=0 && (outstr.endsWith("0") || outstr.endsWith("."))) {
         if (outstr.endsWith("0")) outstr.remove(outstr.length()-1);
         else if (outstr.endsWith(".")) { outstr.remove(outstr.length()-1); break; }
     }
-    
-    free(out); free(op); free(st); 
+
     return outstr;
 }
 void tokenizeLine(const String &line, String tokens[], int &count, int maxTokens) {
@@ -2283,12 +2462,13 @@ void executeCommandLine(const String &raw) {
         pushScrollback("fkey         - Show F-key functions.");
         pushScrollback("send <file>  - Send file to PC via USB.");
         pushScrollback("format       - Format LT-FS partition.");
+        pushScrollback("df           - Disk usage information.");
         pushScrollback("cube         - 3D CUBE, back to exit.");
         pushScrollback("mood         - Cycle through RGB colors.");
         pushScrollback("moon         - Moon phases.");
     } else if (cmd == "fkey") {
-        pushScrollback("F1: Print last command, char by char.");
         pushScrollback("--- F-Key functionality: ---");
+        pushScrollback("F1: Print last command, char by char.");
         pushScrollback("F2: Copy last cmd up to char.");
         pushScrollback("F3: Repeat last cmd.");
         pushScrollback("F4: Delete current cmd up to char.");
@@ -2353,16 +2533,33 @@ void executeCommandLine(const String &raw) {
             pushSystemMessage("Usage: calc <expression>");
         } else {
             String expr = raw.substring(cmd.length());
-            expr.trim(); 
+            expr.trim(); // expr now holds the user's input expression like "1+1"
             String result = evalCalc(expr);
             if (result.startsWith("ERR"))
                 pushSystemMessage("Error: Invalid expression or " + result.substring(4) + ".");
             else if (result.startsWith("INF"))
                 pushSystemMessage("Error: Division by zero.");
             else
-                pushScrollback("= " + result);
+                // pushScrollback("= " + result); // Old line
+                pushScrollback(expr + " = " + result); // New line: Include the original expression
         }
-
+    } else if (cmd == "a") {
+        if (count < 2) {
+            pushSystemMessage("Usage: pic <filename.bmp>");
+        } else if (!fsReady) {
+            pushSystemMessage("Error: LittleFS not available.");
+        } else {
+            String filename = tokens[1];
+            if (!filename.endsWith(".bmp")) { // Basic check
+                pushSystemMessage("Error: Only .bmp files supported.");
+            } else if (!LittleFS.exists(filename)) {
+                pushSystemMessage("Error: File not found: " + filename);
+            } else {
+                displayImage(filename); // Call the display function
+                // NOTE: displayImage handles restoring the terminal
+                return; // Important: Don't redraw/clear command after image display
+            }
+        }
     } else if (cmd == "ls") {
         pushScrollback(listFiles());
 
@@ -2392,6 +2589,39 @@ void executeCommandLine(const String &raw) {
             
             // Draw the new confirmation prompt immediately.
             drawFullTerminal(); 
+        }
+    } else if (cmd == "df") {
+        if (!fsReady) { // Check if LittleFS is mounted 
+            pushSystemMessage("Error: LittleFS not available.");
+        } else {
+            #ifdef ESP32 // ESP32 uses totalBytes()/usedBytes() directly
+                size_t totalBytes = LittleFS.totalBytes();
+                size_t usedBytes = LittleFS.usedBytes();
+            #else // RP2040 uses FSInfo struct
+                FSInfo fs_info;
+                if (!LittleFS.info(fs_info)) {
+                     pushSystemMessage("Error: Could not get FS info.");
+                     drawFullTerminal(); // Redraw to show error
+                     clearCurrentCommand();
+                     return; // Exit early on error
+                }
+                size_t totalBytes = fs_info.totalBytes;
+                size_t usedBytes = fs_info.usedBytes;
+            #endif
+
+            size_t freeBytes = totalBytes - usedBytes;
+
+            // Format nicely in KB
+            String totalStr = String(totalBytes / 1024) + "KB";
+            String usedStr = String(usedBytes / 1024) + "KB";
+            String freeStr = String(freeBytes / 1024) + "KB";
+
+            // Add spaces for basic alignment (adjust spacing as needed)
+            String header = "Filesystem   Size   Used  Available";
+            String data   = "/           " + totalStr + "  " + usedStr + "   " + freeStr;
+
+            pushScrollback(header);
+            pushScrollback(data);
         }
     } else if (cmd == "pi") {
         String piValue = String(PI_VALUE, 18);
