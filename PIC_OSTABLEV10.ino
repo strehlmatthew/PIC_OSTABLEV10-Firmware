@@ -116,6 +116,12 @@ String deviceVersion = "PICOS CLI v7.77"; // UPDATED VERSION
 bool cursorVisible = true;
 unsigned long lastBlink = 0;
 const unsigned long BLINK_MS = 600;
+unsigned long timerEndTime = 0;
+unsigned long lastTimerActiveBlink = 0;
+const unsigned long TIMER_ACTIVE_BLINK_INTERVAL_MS = 10000;
+unsigned long timerFinishedBlinkEndTime = 0; 
+unsigned long lastFinishedBlinkToggle = 0; 
+const unsigned long FINISHED_BLINK_INTERVAL_MS = 500;
 // ----------------------------
 // Terminal buffers
 // ----------------------------
@@ -2453,16 +2459,18 @@ void executeCommandLine(const String &raw) {
         pushScrollback("clear        - Clear terminal history.");
         pushScrollback("calc <expr>  - Evaluate simple math.");
         pushScrollback("pi           - Display Rainbow Pi"); 
+        pushScrollback("timer <min>  - Start timer (minutes).");
         pushScrollback("ls           - List files on LittleFS.");
         pushScrollback("cat <file>   - Display file content.");
         pushScrollback("echo <text> >/>> <file> - Write file.");
         pushScrollback("rm <file>    - Delete a file.");
+        pushScrollback("send <file>  - Send file to PC via USB.");
+        pushScrollback("format       - Format LT-FS partition.");
+        pushScrollback("df           - Disk usage information.");        
         pushScrollback("ver          - Display version info.");
         pushScrollback("time         - Show uptime since boot.");
         pushScrollback("fkey         - Show F-key functions.");
-        pushScrollback("send <file>  - Send file to PC via USB.");
-        pushScrollback("format       - Format LT-FS partition.");
-        pushScrollback("df           - Disk usage information.");
+        pushScrollback("pic <f.bmp>  - Display BMP picture.");
         pushScrollback("cube         - 3D CUBE, back to exit.");
         pushScrollback("mood         - Cycle through RGB colors.");
         pushScrollback("moon         - Moon phases.");
@@ -2543,7 +2551,25 @@ void executeCommandLine(const String &raw) {
                 // pushScrollback("= " + result); // Old line
                 pushScrollback(expr + " = " + result); // New line: Include the original expression
         }
-    } else if (cmd == "a") {
+    } else if (cmd == "timer") {
+        if (count < 2) {
+            pushSystemMessage("Usage: timer <minutes>");
+        } else {
+            // Attempt to convert the argument to an integer
+            long minutes = tokens[1].toInt(); // Use long for safety
+
+            if (minutes <= 0) {
+                pushSystemMessage("Error: Minutes must be a positive number.");
+            } else if (timerEndTime > 0) {
+                 pushSystemMessage("Error: Another timer is already running.");
+            } else {
+                // Calculate end time in milliseconds
+                // Use UL suffix for unsigned long constants to prevent overflow
+                timerEndTime = millis() + (unsigned long)minutes * 60000UL;
+                pushSystemMessage("Timer: " + String(minutes) + " min(s), Blink = 10s");
+            }
+        }
+    } else if (cmd == "pic") {
         if (count < 2) {
             pushSystemMessage("Usage: pic <filename.bmp>");
         } else if (!fsReady) {
@@ -3104,6 +3130,29 @@ void setup() {
 // ----------------------------
 void loop() {
     unsigned long now = millis();
+
+    //Timer:
+    if (timerEndTime > 0 && now >= timerEndTime) {
+        timerEndTime = 0; // Deactivate the main timer
+        lastTimerActiveBlink = 0; // Reset periodic blink timer
+        pushSystemMessage(">>> Timer Finished! <<<");
+
+        // *** Start the 10-second BLINKING PERIOD ***
+        timerFinishedBlinkEndTime = now + 10000; // Set when the blinking stops
+        lastFinishedBlinkToggle = now;           // Set time for first toggle check
+        digitalWrite(STATUS_LED_PIN, HIGH);     // Start with LED ON
+
+        drawFullTerminal(); // Force redraw to show the message immediately
+    }
+    if (timerEndTime > 0) { // Check if timer is running
+        if (now - lastTimerActiveBlink >= TIMER_ACTIVE_BLINK_INTERVAL_MS) {
+            lastTimerActiveBlink = now; // Reset the interval timer
+
+            // Start a SHORT blink (using existing mechanism)
+            ledBlinkEndTime = now + LED_BLINK_DURATION_MS; // Use the short duration
+            digitalWrite(STATUS_LED_PIN, HIGH);
+        }
+    }
 
     // Cursor blinking
     if (now - lastBlink >= BLINK_MS) {
