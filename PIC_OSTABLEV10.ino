@@ -535,7 +535,7 @@ void drawMoon(int day, int totalDays) {
     // --- Draw the day number underneath ---
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    String dayText = "Day " + String(day + 1);
+    String dayText = "Phase: " + String(day + 1);
     
     int16_t x1, y1;
     uint16_t w, h;
