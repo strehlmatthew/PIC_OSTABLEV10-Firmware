@@ -486,9 +486,10 @@ void nano_drawTextArea() {
     }
 }
 void nano_drawFooter() {
-    int startY = SCREEN_HEIGHT - (NANO_FOOTER_LINES * LINE_HEIGHT);
+    int textOffsetY = 1; // <-- NEW: Vertical offset for text
+    int startY = SCREEN_HEIGHT - (NANO_FOOTER_LINES * LINE_HEIGHT); // Y position for the blue bar
 
-    // Clear the entire footer area first
+    // 1. Clear the entire footer area first (unchanged)
     tft.fillRect(0, startY, SCREEN_WIDTH, NANO_FOOTER_LINES * LINE_HEIGHT, ST77XX_BLUE);
 
     // --- Draw based on current focus ---
@@ -496,63 +497,73 @@ void nano_drawFooter() {
     if (nano_focus == NANO_AWAIT_SAVE_CONFIRM) {
         // --- Draw Save Confirmation Prompt ---
         String promptText = " Save modified buffer? (Y/N)";
-        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK); // Prompt color
-        tft.setCursor(0, startY);
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLUE); // Prompt color over blue BG
+
+        // --- MODIFIED: Added textOffsetY ---
+        tft.setCursor(0, startY + textOffsetY);
         tft.print(promptText);
 
         int ynX = promptText.length() * CHAR_WIDTH;
-        int ynY = startY;
+        // --- MODIFIED: Added textOffsetY ---
+        int ynY = startY + textOffsetY;
 
         // Draw 'Y' (index 0)
         uint16_t bgY = (nano_saveConfirmSelection == 0 && cursorVisible) ? ST77XX_GREEN : ST77XX_BLUE;
         uint16_t fgY = (nano_saveConfirmSelection == 0 && cursorVisible) ? ST77XX_BLUE : ST77XX_GREEN;
+        // --- MODIFIED: Need to adjust fillRect for highlight position ---
+        tft.fillRect(ynX, startY, CHAR_WIDTH, LINE_HEIGHT, bgY); // Fill background behind Y
         tft.setCursor(ynX, ynY);
         tft.setTextColor(fgY, bgY);
         tft.print("Y");
 
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLUE); // Separator color
+        int separatorX = tft.getCursorX(); // Get X after printing Y
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLUE); // Separator color over blue
+        // --- MODIFIED: Added textOffsetY ---
+        tft.setCursor(separatorX, startY + textOffsetY);
         tft.print("/");
 
+        int nX = tft.getCursorX(); // Get X after printing /
         // Draw 'N' (index 1)
         uint16_t bgN = (nano_saveConfirmSelection == 1 && cursorVisible) ? ST77XX_RED : ST77XX_BLUE;
         uint16_t fgN = (nano_saveConfirmSelection == 1 && cursorVisible) ? ST77XX_BLUE : ST77XX_RED;
+        // --- MODIFIED: Need to adjust fillRect for highlight position ---
+        tft.fillRect(nX, startY, CHAR_WIDTH, LINE_HEIGHT, bgN); // Fill background behind N
+        tft.setCursor(nX, ynY);
         tft.setTextColor(fgN, bgN);
         tft.print("N");
 
         // Clear rest of the line
         int endX = tft.getCursorX();
-        tft.fillRect(endX, ynY, SCREEN_WIDTH - endX, LINE_HEIGHT, ST77XX_BLUE);
-        // Second footer line remains clear
+        // --- MODIFIED: Clear from original startY ---
+        tft.fillRect(endX, startY, SCREEN_WIDTH - endX, LINE_HEIGHT, ST77XX_BLUE);
 
     } else {
-        // --- Draw Standard Command Options (for FOCUS_TEXT or FOCUS_FOOTER) ---
-        // Display static command hints on the first footer line
-        String opt1 = " Save"; // Mapped to selection 0
-        String opt2 = " Exit"; // Mapped to selection 1
+        // --- Draw Standard Command Options (Save/Exit) ---
+        String opt1 = " Save";
+        String opt2 = " Exit";
         int halfWidth = SCREEN_WIDTH / 2;
 
-        // Determine colors based on whether footer has focus and which item is selected
+        // Determine colors based on focus
         uint16_t bg1 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 0 && cursorVisible) ? ST77XX_WHITE : ST77XX_BLUE;
         uint16_t fg1 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 0 && cursorVisible) ? ST77XX_BLUE : ST77XX_WHITE;
         uint16_t bg2 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 1 && cursorVisible) ? ST77XX_WHITE : ST77XX_BLUE;
         uint16_t fg2 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 1 && cursorVisible) ? ST77XX_BLUE : ST77XX_WHITE;
 
         // Draw Save option
-        tft.setTextColor(fg1, bg1);
-        tft.setCursor(0, startY);
-        tft.print(opt1);
         int opt1EndX = opt1.length() * CHAR_WIDTH;
-        tft.fillRect(opt1EndX, startY, halfWidth - opt1EndX, LINE_HEIGHT, bg1); // Clear rest of section
+        // --- MODIFIED: Fill background first, then draw text offset ---
+        tft.fillRect(0, startY, halfWidth, LINE_HEIGHT, bg1); // Fill Save section BG
+        tft.setTextColor(fg1, bg1);
+        tft.setCursor(0, startY + textOffsetY); // <-- Add offset
+        tft.print(opt1);
 
         // Draw Exit option
+        int opt2StartX = halfWidth;
+        // --- MODIFIED: Fill background first, then draw text offset ---
+        tft.fillRect(opt2StartX, startY, SCREEN_WIDTH - opt2StartX, LINE_HEIGHT, bg2); // Fill Exit section BG
         tft.setTextColor(fg2, bg2);
-        tft.setCursor(halfWidth, startY);
+        tft.setCursor(halfWidth, startY + textOffsetY); // <-- Add offset
         tft.print(opt2);
-        int opt2EndX = halfWidth + opt2.length() * CHAR_WIDTH;
-        tft.fillRect(opt2EndX, startY, SCREEN_WIDTH - opt2EndX, LINE_HEIGHT, bg2); // Clear rest of section
-
-        // The second line of the footer remains clear (no keyboard preview drawn here)
-        // tft.fillRect(0, startY + LINE_HEIGHT, SCREEN_WIDTH, LINE_HEIGHT, ST77XX_BLACK); // Already cleared
     }
 }
 void nano_drawEditorCursor() {
