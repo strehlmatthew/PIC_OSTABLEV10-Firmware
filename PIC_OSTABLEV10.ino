@@ -82,10 +82,10 @@ const char alphaChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const char alphaLowerChars[] = "abcdefghijklmnopqrstuvwxyz";
 const char numberChars[] = "0123456789";
 const char symbolChars[] = ".,!?;:'\"-_=+()[]{}<>/\\|@#$%^&*`~";
-const String ctrlKeys[] = {"SPACE","ENTER","DELETE","LEFT","RIGHT"}; 
+const String ctrlKeys[] = {"SPACE","ENTER","DELETE","LEFT","RIGHT", "UP", "DOWN"}; 
 const String funcKeys[] = {"F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"}; 
 const char* modeLabels[] = {"ALPHA", "NUM", "SYM", "CTRL"}; 
-const int CTRL_COUNT = 5;
+const int CTRL_COUNT = 7;
 const int FUNC_COUNT = 12;
 const double PI_VALUE = 3.14159265358979323846; // High precision PI
 int kbIndex = 0; // current character index (0 = mode label)
@@ -204,6 +204,37 @@ void storeRainbowData(int scrollbackIndex, const String &s) {
     }
 }
 // ----------------------------
+// NANO EDITOR STATE
+// ----------------------------
+#define NANO_MAX_LINES 1000      // Max lines the editor can hold (RAM limit)
+#define NANO_MAX_LINE_LEN 120   // Max characters per line (adjust based on RAM/performance)
+String nano_lines[NANO_MAX_LINES]; // Array to hold the text lines
+int nano_lineCount = 0;           // Number of lines currently in the buffer
+String nano_filename = "";        // Name of the file being edited
+bool nano_isModified = false;     // Flag: true if file has unsaved changes
+bool nano_exitRequested = false; // Add this near other nano_ state variables
+// Cursor position *within the text buffer* (not screen position)
+int nano_cursorLine = 0; // Index of the line the cursor is on
+int nano_cursorCol = 0;  // Index of the character the cursor is before (0 = start)
+// Viewport state (which part of the file is visible)
+int nano_topLine = 0;    // Index of the first file line displayed at the top of the text area
+bool isNanoActive = false;
+// UI Focus state
+enum NanoFocus {
+    FOCUS_TEXT,     // Cursor is in the main text editing area
+    FOCUS_FOOTER,   // Selection is on the bottom command bar
+    FOCUS_HEADER,   // Selection is on the top status bar (optional)
+    NANO_AWAIT_SAVE_CONFIRM    
+};
+NanoFocus nano_focus = FOCUS_TEXT; // Start focus in the text area
+int nano_footerSelection = 0; // Index of the currently selected footer option (e.g., 0=Save, 1=Exit)
+int nano_saveConfirmSelection = 0; // Index for Save Y/N (0=Y, 1=N)
+
+// Screen layout constants for the editor UI (derived from existing defines)
+const int NANO_HEADER_LINES = 1;      // Height of the status bar at the top
+const int NANO_FOOTER_LINES = 1;      // Height of the command bar + virtual keyboard preview
+const int NANO_TEXT_AREA_LINES = (SCREEN_HEIGHT / LINE_HEIGHT) - NANO_HEADER_LINES - NANO_FOOTER_LINES; // Height available for text
+// ----------------------------
 // 3D CUBE DEFINITIONS
 // ----------------------------
 struct Point3D {
@@ -246,11 +277,14 @@ void executeCommandLine(const String &raw);
 String trimStr(const String &s);
 String evalCalc(const String &expr);
 void tokenizeLine(const String &line, String tokens[], int &count, int maxTokens);
+void runNanoEditor(String filename);
+void nano_handleInput();
 bool fsBegin();
 String listFiles();
 String readFile(const String &path);
 bool writeFile(const String &path, const String &data, bool append); 
 bool removeFile(const String &path);
+String findFileCaseInsensitive(const String& filename);
 void kbPrev(); 
 void kbNext();
 void kbConfirm();
@@ -268,6 +302,7 @@ void runMoonPhase();
 void drawMoon(int day, int totalDays);
 void drawStars(); // Add this prototype
 void displayImage(const String& filename);
+bool nano_insertChar_DataWorker(char c);
 uint16_t read16(File &f);
 uint32_t read32(File &f);
 Point3D rotateX(Point3D p, float angle);
@@ -286,11 +321,9 @@ void wdt_enable_platform() {
     // If your WDT implementation requires setup, place it here. 
     // For now, an empty function is safe to prevent immediate re-triggering issues.
 }
-
 void invalidateTerminalCache() {
     prevVisibleCount = 0;
 }
-// Helper function to read a 16-bit value from a file (BMP uses little-endian)
 uint16_t read16(File &f) {
   uint16_t result;
   uint8_t buffer[2];
@@ -300,8 +333,1280 @@ uint16_t read16(File &f) {
   }
   return 0; // Error case
 }
+void nano_drawUI() {
+    // Clear potentially unused areas (optional, but can help prevent artifacts)
+    // tft.fillScreen(ST77XX_BLACK); // Or clear specific regions if needed
 
-// Helper function to read a 32-bit value from a file (BMP uses little-endian)
+    nano_drawHeader();     // Draw the top status bar
+    nano_drawTextArea();   // Draw the main text content
+    nano_drawFooter();     // Draw the bottom command bar/keyboard preview
+    // The cursor is drawn separately during the blink cycle or after input
+}
+void runNanoEditor(String filename) {
+    tft.fillScreen(ST77XX_BLACK);
+    // --- SETUP ---
+    nano_filename = filename; // Store the filename globally
+    nano_isModified = false;  // File is not modified initially
+    nano_cursorLine = 0;      // Cursor starts at top-left
+    nano_cursorCol = 0;
+    nano_topLine = 0;         // Viewport starts at the top
+    nano_focus = FOCUS_TEXT;  // Start focus in the text area
+    nano_footerSelection = 0; // Default footer selection (e.g., "Save")
+    nano_lineCount = 0;       // Reset line count before loading
+    nano_exitRequested = false; // Ensure exit flag is reset
+    isNanoActive = true; // <-- SET THE FLAG
+    kmode = ALPHA;      // <-- ADD THIS LINE
+    kbIndex = 0;
+    nano_filename = filename;
+    // Attempt to load the file into the nano_lines buffer
+    if (!nano_loadFile(filename)) {
+        // If file doesn't exist or failed to load, start with a new empty buffer
+        nano_lineCount = 1;      // Start with one empty line
+        nano_lines[0] = "";      // Initialize the first line
+        // nano_isModified = true; // Optional: Mark new buffer as needing save
+    }
+
+    // --- MAIN EDITOR LOOP ---
+    bool editorRunning = true; // Flag to control the loop
+    nano_drawUI();             // Perform the initial full draw of the editor interface
+
+    while (editorRunning) {
+        unsigned long now = millis();
+        bool inputDetected = false;
+        int buttonPressed = -1;
+        
+        // --- Check Buttons ---
+        // Scan for a button press, applying debounce cooldown
+        for (int i = 0; i < NUM_BUTTONS; ++i) { //
+            if (digitalRead(buttonPins[i]) == HIGH && (now - lastPressTime[i] > pressCooldown)) { //
+                lastPressTime[i] = now;  // Update last press time for debounce
+                buttonPressed = i;       // Store which button was pressed
+                inputDetected = true;
+                break; // Handle one button press per loop iteration
+            }
+        }
+
+        // --- Handle Input if Detected ---
+        if (inputDetected) {
+            // Reset cursor blink timer on any input to make cursor appear immediately
+            lastBlink = now; //
+            cursorVisible = true; //
+
+            // Call the main input handler function (we implemented this previously)
+            nano_handleInput(buttonPressed);
+
+            // Check if handler requested exit
+            if (nano_exitRequested) {
+                 editorRunning = false; // Set flag to exit the loop
+            }
+
+        } else {
+            // --- Handle Cursor/Focus Blinking if NO input ---
+            if (now - lastBlink >= BLINK_MS) { //
+                lastBlink = now; //
+                cursorVisible = !cursorVisible; // Toggle blink state
+
+                // Call correct drawing function based on focus for blinking effect
+                if (nano_focus == FOCUS_TEXT) {
+                    // *** CHANGE HERE: Use standard cursor/preview for text focus ***
+                    nano_drawEditorCursor(); //
+                } else if (nano_focus == FOCUS_FOOTER || nano_focus == NANO_AWAIT_SAVE_CONFIRM) { // Blink footer/prompt
+                    // Footer draws itself with highlight based on cursorVisible
+                    nano_drawFooter();
+                } else if (nano_focus == FOCUS_HEADER) {
+                    // Header draws itself with highlight based on cursorVisible
+                    nano_drawHeader();
+                }
+            }
+        }
+
+        yield(); // IMPORTANT: Keep the Pico responsive
+    } // --- End Main Editor Loop ---
+
+    // --- EXIT & RESTORE TERMINAL ---
+    isNanoActive = false; // <-- RESET THE FLAG
+    tft.fillScreen(ST77XX_BLACK);      // Clear the screen
+    invalidateTerminalCache();        // Reset terminal drawing cache
+    drawFullTerminal();               // Redraw the main terminal interface
+    clearCurrentCommand();            // Clear any leftover command text
+}
+void nano_drawHeader() {
+    int y = 0; // Header is at the top row
+    // Prepare header text
+    String headerText = " File: " + nano_filename;
+    if (nano_isModified) {
+        headerText += " *"; // Add asterisk if modified
+    }
+
+    // Set colors based on focus
+    uint16_t bgColor = ST77XX_BLACK;
+    uint16_t fgColor = ST77XX_WHITE;
+    if (nano_focus == FOCUS_HEADER && cursorVisible) { // Invert colors if header focused and cursor ON
+        bgColor = ST77XX_WHITE;
+        fgColor = ST77XX_BLACK;
+    }
+
+    // Draw background and text
+    tft.fillRect(0, y, SCREEN_WIDTH, LINE_HEIGHT * NANO_HEADER_LINES, bgColor);
+    tft.setCursor(0, y);
+    tft.setTextColor(fgColor, bgColor);
+    tft.print(headerText);
+
+    // Clear rest of the line (in case filename is short)
+    int textWidth = headerText.length() * CHAR_WIDTH;
+    if (textWidth < SCREEN_WIDTH) {
+        tft.fillRect(textWidth, y, SCREEN_WIDTH - textWidth, LINE_HEIGHT * NANO_HEADER_LINES, bgColor);
+    }
+}
+void nano_drawTextArea() {
+    int startY = NANO_HEADER_LINES * LINE_HEIGHT; // Y position after the header
+    int endY = startY + NANO_TEXT_AREA_LINES * LINE_HEIGHT;
+
+    // Clear the entire text area first
+    tft.fillRect(0, startY, SCREEN_WIDTH, NANO_TEXT_AREA_LINES * LINE_HEIGHT, ST77XX_BLACK);
+
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); // Default text color
+
+    // Loop through the screen lines allocated for the text area
+    for (int screenLine = 0; screenLine < NANO_TEXT_AREA_LINES; ++screenLine) {
+        int fileLineIndex = nano_topLine + screenLine; // Calculate the index in the nano_lines buffer
+
+        // Check if this line index is valid within the loaded file content
+        if (fileLineIndex < nano_lineCount) {
+            String lineContent = nano_lines[fileLineIndex];
+            // TODO: Add horizontal scrolling logic here if needed
+            // For now, just display the start of the line
+            tft.setCursor(0, startY + screenLine * LINE_HEIGHT);
+            tft.print(lineContent.substring(0, COLS)); // Print chars that fit on screen
+        } else {
+            // Optionally draw a character like '~' for lines beyond the end of the file
+            // tft.setCursor(0, startY + screenLine * LINE_HEIGHT);
+            // tft.print("~");
+        }
+    }
+}
+void nano_drawFooter() {
+    int startY = SCREEN_HEIGHT - (NANO_FOOTER_LINES * LINE_HEIGHT);
+
+    // Clear the entire footer area first
+    tft.fillRect(0, startY, SCREEN_WIDTH, NANO_FOOTER_LINES * LINE_HEIGHT, ST77XX_BLUE);
+
+    // --- Draw based on current focus ---
+
+    if (nano_focus == NANO_AWAIT_SAVE_CONFIRM) {
+        // --- Draw Save Confirmation Prompt ---
+        String promptText = " Save modified buffer? (Y/N)";
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK); // Prompt color
+        tft.setCursor(0, startY);
+        tft.print(promptText);
+
+        int ynX = promptText.length() * CHAR_WIDTH;
+        int ynY = startY;
+
+        // Draw 'Y' (index 0)
+        uint16_t bgY = (nano_saveConfirmSelection == 0 && cursorVisible) ? ST77XX_GREEN : ST77XX_BLUE;
+        uint16_t fgY = (nano_saveConfirmSelection == 0 && cursorVisible) ? ST77XX_BLUE : ST77XX_GREEN;
+        tft.setCursor(ynX, ynY);
+        tft.setTextColor(fgY, bgY);
+        tft.print("Y");
+
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLUE); // Separator color
+        tft.print("/");
+
+        // Draw 'N' (index 1)
+        uint16_t bgN = (nano_saveConfirmSelection == 1 && cursorVisible) ? ST77XX_RED : ST77XX_BLUE;
+        uint16_t fgN = (nano_saveConfirmSelection == 1 && cursorVisible) ? ST77XX_BLUE : ST77XX_RED;
+        tft.setTextColor(fgN, bgN);
+        tft.print("N");
+
+        // Clear rest of the line
+        int endX = tft.getCursorX();
+        tft.fillRect(endX, ynY, SCREEN_WIDTH - endX, LINE_HEIGHT, ST77XX_BLUE);
+        // Second footer line remains clear
+
+    } else {
+        // --- Draw Standard Command Options (for FOCUS_TEXT or FOCUS_FOOTER) ---
+        // Display static command hints on the first footer line
+        String opt1 = " Save"; // Mapped to selection 0
+        String opt2 = " Exit"; // Mapped to selection 1
+        int halfWidth = SCREEN_WIDTH / 2;
+
+        // Determine colors based on whether footer has focus and which item is selected
+        uint16_t bg1 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 0 && cursorVisible) ? ST77XX_WHITE : ST77XX_BLUE;
+        uint16_t fg1 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 0 && cursorVisible) ? ST77XX_BLUE : ST77XX_WHITE;
+        uint16_t bg2 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 1 && cursorVisible) ? ST77XX_WHITE : ST77XX_BLUE;
+        uint16_t fg2 = (nano_focus == FOCUS_FOOTER && nano_footerSelection == 1 && cursorVisible) ? ST77XX_BLUE : ST77XX_WHITE;
+
+        // Draw Save option
+        tft.setTextColor(fg1, bg1);
+        tft.setCursor(0, startY);
+        tft.print(opt1);
+        int opt1EndX = opt1.length() * CHAR_WIDTH;
+        tft.fillRect(opt1EndX, startY, halfWidth - opt1EndX, LINE_HEIGHT, bg1); // Clear rest of section
+
+        // Draw Exit option
+        tft.setTextColor(fg2, bg2);
+        tft.setCursor(halfWidth, startY);
+        tft.print(opt2);
+        int opt2EndX = halfWidth + opt2.length() * CHAR_WIDTH;
+        tft.fillRect(opt2EndX, startY, SCREEN_WIDTH - opt2EndX, LINE_HEIGHT, bg2); // Clear rest of section
+
+        // The second line of the footer remains clear (no keyboard preview drawn here)
+        // tft.fillRect(0, startY + LINE_HEIGHT, SCREEN_WIDTH, LINE_HEIGHT, ST77XX_BLACK); // Already cleared
+    }
+}
+void nano_drawEditorCursor() {
+    // --- Static variables to track the PREVIOUS cursor state ---
+    static int nano_lastCursorScreenX = -1;
+    static int nano_lastCursorScreenY = -1;
+    static int nano_lastPreviewWidth = 0; // NEW: Track the width of the last preview
+    static String nano_lastStringUnderCursor = ""; // NEW: Track the full string that was under
+    static bool nano_wasCursorVisibleLast = false;
+
+    // --- 1. Calculate Current Screen Position ---
+    if (nano_focus != FOCUS_TEXT) {
+        // If focus isn't on the text, we still need to clear the last cursor drawing
+        if (nano_lastCursorScreenX != -1) {
+            // (The clearing logic below will handle this)
+        } else {
+            return; // Nothing to do if focus is elsewhere and no cursor was ever drawn
+        }
+    }
+    
+    int screenLine = nano_cursorLine - nano_topLine;
+    int screenCol = nano_cursorCol;
+    if (screenLine < 0 || screenLine >= NANO_TEXT_AREA_LINES) {
+        // To prevent artifacts, ensure the old cursor is erased if it goes off-screen
+        screenCol = -1; // Mark as invalid for drawing, but allow clearing to proceed
+    }
+    
+    int screenX = screenCol * CHAR_WIDTH;
+    int screenY = (NANO_HEADER_LINES + screenLine) * LINE_HEIGHT;
+    // --- 2. COMPLETE LOGIC to Determine Preview String ---
+    String preview = "";
+    const int ALPHA_CASE_KEY_INDEX = (int)strlen(alphaChars) + 1;
+    const int NUM_ALPHA_KEY_INDEX = (int)strlen(numberChars) + 1;
+    const int SYM_ALPHA_KEY_INDEX = (int)strlen(symbolChars) + 1;
+    if (kbIndex == 0) { preview = kbGetModeName(); }
+    else if (kmode == ALPHA) {
+        if (kbIndex <= (int)strlen(alphaChars)) { preview = String(alphaChars[kbIndex - 1]);
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { preview = "[SPACE]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { preview = "[CASE]";
+        }
+    }
+    else if (kmode == ALPHA_LOWER) {
+        if (kbIndex <= (int)strlen(alphaLowerChars)) { preview = String(alphaLowerChars[kbIndex - 1]);
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX) { preview = "[SPACE]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { preview = "[case]";
+        }
+    }
+    else if (kmode == NUM) {
+        if (kbIndex <= (int)strlen(numberChars)) { preview = String(numberChars[kbIndex - 1]);
+        }
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX) { preview = "[SPACE]";
+        }
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == NUM_ALPHA_KEY_INDEX + 2) { preview = "[ALPHA]";
+        }
+    }
+    else if (kmode == SYM) {
+        if (kbIndex <= (int)strlen(symbolChars)) { preview = String(symbolChars[kbIndex - 1]);
+        }
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX) { preview = "[SPACE]";
+        }
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 1) { preview = "[ENTER]";
+        }
+        else if (kbIndex == SYM_ALPHA_KEY_INDEX + 2) { preview = "[ALPHA]";
+        }
+    }
+    else if (kmode == CTRL) {
+        if (kbIndex <= CTRL_COUNT) { preview = "[" + ctrlKeys[kbIndex - 1] + "]";
+        }
+        else if (kbIndex == CTRL_COUNT + 1) { preview = "[FUNC]";
+        }
+    }
+    else if (kmode == FUNC_VIEW) {
+        if (kbIndex <= FUNC_COUNT) { preview = "[" + funcKeys[kbIndex - 1] + "]";
+        }
+    }
+
+    if (preview.length() == 0) preview = "?"; // Fallback for unhandled cases
+
+    String stringUnderCursor = "";
+    int previewWidth = max(1, (int)preview.length());
+    if (nano_cursorLine < nano_lineCount) {
+        stringUnderCursor = nano_lines[nano_cursorLine].substring(nano_cursorCol, nano_cursorCol + previewWidth);
+    }
+    while(stringUnderCursor.length() < previewWidth) {
+        stringUnderCursor += " "; // Pad with spaces if at end of line
+    }
+
+    // --- 3. REFACTORED: Loop to clear the entire area of the *previous* preview ---
+    if (nano_lastCursorScreenX != -1) {
+        int prevDrawX = nano_lastCursorScreenX;
+        int prevDrawY = nano_lastCursorScreenY;
+
+        // Loop over the width of the OLD preview, redrawing the original text
+        for (int i = 0; i < nano_lastPreviewWidth; ++i) {
+            // --- ADD THIS WRAPPING LOGIC ---
+            if (prevDrawX >= SCREEN_WIDTH) {
+                prevDrawX = 0;
+                prevDrawY += LINE_HEIGHT;
+            }
+            // --- END OF CHANGE ---
+
+            // Find the line of text that was under this part of the OLD cursor
+            int prevLineIndex = (prevDrawY / LINE_HEIGHT) - NANO_HEADER_LINES + nano_topLine;
+            String prevLineText = "";
+            if (prevLineIndex >= 0 && prevLineIndex < nano_lineCount) {
+                prevLineText = nano_lines[prevLineIndex];
+            }
+            int prevCol = prevDrawX / CHAR_WIDTH;
+            
+            // Clear the old block
+            tft.fillRect(prevDrawX, prevDrawY, CHAR_WIDTH, LINE_HEIGHT, ST77XX_BLACK);
+            
+            // Redraw the character that is NOW at the old location
+            if (prevCol < prevLineText.length()) {
+                tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+                tft.setCursor(prevDrawX, prevDrawY);
+                tft.print(prevLineText.charAt(prevCol));
+            }
+            prevDrawX += CHAR_WIDTH;
+        }
+    }
+    
+    // Don't draw a new cursor if it's off-screen or focus is lost
+    if (screenCol < 0 || nano_focus != FOCUS_TEXT) {
+        // Invalidate last position so it doesn't try to clear again from a bad spot
+        nano_lastCursorScreenX = -1; 
+        return;
+    }
+
+    // --- 4. Determine Colors ---
+    uint16_t bgColor = ST77XX_BLACK;
+    uint16_t fgColor = ST77XX_WHITE;
+    uint16_t modeTextColor = ST77XX_WHITE;
+
+    if (kmode == ALPHA || kmode == ALPHA_LOWER) modeTextColor = ST77XX_CYAN;
+    else if (kmode == NUM) modeTextColor = ST77XX_GREEN;
+    else if (kmode == SYM) modeTextColor = ST77XX_MAGENTA;
+    else if (kmode == CTRL) modeTextColor = ST77XX_DARK_ORANGE;
+    
+    if (cursorVisible) { // Cursor ON (Highlighted)
+        bgColor = (kbIndex == 0) ? modeTextColor : ST77XX_WHITE;
+        fgColor = ST77XX_BLACK;
+    } else { // Cursor OFF (Hollow)
+        bgColor = ST77XX_BLACK;
+        fgColor = (kbIndex == 0) ? modeTextColor : ST77XX_WHITE;
+    }
+
+    // --- 5. REFACTORED: Loop to draw the new, potentially multi-character preview ---
+    int currentDrawX = screenX;
+    int currentDrawY = screenY;
+    for (int i = 0; i < previewWidth; ++i) {
+        if (currentDrawX >= SCREEN_WIDTH) {
+            currentDrawX = 0;
+            currentDrawY += LINE_HEIGHT;
+        }
+        if (currentDrawY >= (NANO_HEADER_LINES + NANO_TEXT_AREA_LINES) * LINE_HEIGHT) {
+            break; // Stop if we draw past the text area
+        }
+        tft.fillRect(currentDrawX, currentDrawY, CHAR_WIDTH, LINE_HEIGHT, bgColor);
+        tft.setTextColor(fgColor, bgColor);
+        tft.setCursor(currentDrawX, currentDrawY);
+        tft.print(preview.charAt(i));
+        currentDrawX += CHAR_WIDTH;
+    }
+
+    // --- 6. Update State for Next Time ---
+    nano_lastCursorScreenX = screenX;
+    nano_lastCursorScreenY = screenY;
+    nano_lastStringUnderCursor = stringUnderCursor;
+    nano_lastPreviewWidth = previewWidth;
+    nano_wasCursorVisibleLast = cursorVisible;
+}
+void nano_moveCursor(int dx, int dy) {
+    int oldLine = nano_cursorLine; // Store old line for scrolling check
+
+    // --- 1. Update Line Position ---
+    if (dy != 0) {
+        nano_cursorLine += dy;
+        // Clamp cursor line within buffer bounds
+        if (nano_cursorLine < 0) {
+            nano_cursorLine = 0;
+        }
+        if (nano_cursorLine >= nano_lineCount) {
+            nano_cursorLine = nano_lineCount - 1; // Don't go past the last line
+        }
+    }
+
+    // --- 2. Update Column Position ---
+    if (dx != 0) {
+        nano_cursorCol += dx;
+        // Clamp column (initially, can go past end temporarily)
+        if (nano_cursorCol < 0) {
+            nano_cursorCol = 0;
+        }
+        // Max column depends on the (potentially new) current line's length
+        int currentLineLen = (nano_cursorLine < nano_lineCount) ? nano_lines[nano_cursorLine].length() : 0;
+        if (nano_cursorCol > currentLineLen) {
+            nano_cursorCol = currentLineLen;
+        }
+    }
+
+    // --- 3. Adjust Column for Vertical Movement ---
+    // If we moved vertically (dy != 0), clamp the column to the length of the new line.
+    // This handles moving up/down onto shorter or longer lines correctly.
+    if (dy != 0) {
+        int currentLineLen = (nano_cursorLine < nano_lineCount) ? nano_lines[nano_cursorLine].length() : 0;
+        if (nano_cursorCol > currentLineLen) {
+            nano_cursorCol = currentLineLen;
+        }
+    }
+
+    // --- 4. Handle Vertical Scrolling ---
+    bool scrolled = false;
+    // Scroll up? (Cursor moved above the top visible line)
+    if (nano_cursorLine < nano_topLine) {
+        nano_topLine = nano_cursorLine; // Make the cursor line the new top line
+        scrolled = true;
+    }
+    // Scroll down? (Cursor moved below the bottom visible line)
+    else if (nano_cursorLine >= nano_topLine + NANO_TEXT_AREA_LINES) {
+        // Make the cursor line the new bottom line
+        nano_topLine = nano_cursorLine - NANO_TEXT_AREA_LINES + 1;
+        scrolled = true;
+    }
+
+    // --- 5. Redraw if Scrolled ---
+    if (scrolled) {
+        // If the viewport changed, redraw the entire text area
+        nano_drawTextArea();
+        // The main input handler will redraw the cursor afterward
+    }
+
+    // The cursor itself will be redrawn by nano_handleInput or the main blink cycle
+}
+
+void nano_backspace() {
+    // 1. --- Check for 0,0 (cannot backspace) ---
+    if (nano_cursorLine == 0 && nano_cursorCol == 0) {
+        return;
+    }
+
+    bool wasModified = nano_isModified;
+
+    // --- 2. Check for "Fast Path" (single-line delete) ---
+    String &currentLine = nano_lines[nano_cursorLine];
+    bool isLastLine = (nano_cursorLine == nano_lineCount - 1);
+    bool lineNotFull = (currentLine.length() < WRAP_COLS);
+
+    if (nano_cursorCol > 0 && (lineNotFull || isLastLine)) {
+        // --- FAST PATH: Just delete one char and redraw this line ---
+        String beginning = currentLine.substring(0, nano_cursorCol - 1);
+        String end = currentLine.substring(nano_cursorCol);
+        currentLine = beginning + end;
+        
+        nano_cursorCol--; // Move cursor back
+        nano_isModified = true;
+
+        nano_redrawTrailingText(); // Redraw *only* this line
+
+        if (!wasModified) {
+            nano_drawHeader();
+        }
+        return; // We are done. Do not fall through.
+    }
+
+    // --- 3. FULL REFLOW or MERGE LOGIC ---
+    bool needsScrollCheck = false;
+    bool runReflowLoop = false; // Flag to control reflow
+
+    if (nano_cursorCol > 0) {
+        // --- CASE A: Backspace in middle of a *full* line ---
+        String &line = nano_lines[nano_cursorLine];
+        String beginning = line.substring(0, nano_cursorCol - 1);
+        String end = line.substring(nano_cursorCol);
+        line = beginning + end;
+        
+        nano_cursorCol--;
+        nano_isModified = true;
+        runReflowLoop = true; // <-- We *always* reflow in this case
+
+    } else {
+        // --- CASE B: Backspace at the start of a line ---
+        int prevLineIndex = nano_cursorLine - 1;
+        String &prevLine = nano_lines[prevLineIndex];
+        String &currLine = nano_lines[nano_cursorLine];
+
+        // Check if merging will exceed the *hard data limit*
+        if (prevLine.length() + currLine.length() > NANO_MAX_LINE_LEN) {
+             return; // Cannot merge, lines are too long
+        }
+
+        // --- THIS IS THE FIX ---
+        // 1. Check if the previous line was empty *before* the merge.
+        bool prevLineWasEmpty = (prevLine.length() == 0);
+
+        // 2. We are merging, so move the cursor
+        nano_cursorLine--;
+        nano_cursorCol = prevLine.length();
+        nano_isModified = true;
+        needsScrollCheck = true;
+        
+        // 3. Now, *actually merge the line data*
+        prevLine += currLine;
+        
+        // 4. Delete the (now empty) current line
+        for (int j = nano_cursorLine + 1; j < nano_lineCount - 1; j++) {
+            nano_lines[j] = nano_lines[j + 1];
+        }
+        nano_lineCount--;
+        nano_lines[nano_lineCount] = "";
+        
+        // 5. Set the reflow flag based on your rule
+        if (prevLineWasEmpty) {
+            runReflowLoop = false; // Don't reflow if merging into an empty line
+        } else {
+            runReflowLoop = true; // *Always* reflow if merging into a line that had text
+        }
+        // --- END OF FIX ---
+    }
+    
+    // 4. --- CONDITIONAL UPWARD REFLOW ---
+    if (runReflowLoop) {
+        // This loop starts at the current cursor line and pulls text up.
+        for (int i = nano_cursorLine; i < nano_lineCount - 1; i++) {
+            String &lineAbove = nano_lines[i];
+            String &lineBelow = nano_lines[i + 1];
+
+            int spaceLeft = WRAP_COLS - lineAbove.length();
+            if (spaceLeft <= 0) break; // Waterfall stops, line above is full
+
+            int pullUpLen = min(spaceLeft, lineBelow.length());
+            
+            if (pullUpLen > 0) {
+                lineAbove += lineBelow.substring(0, pullUpLen);
+                lineBelow = lineBelow.substring(pullUpLen);
+            }
+
+            if (lineBelow.length() == 0) {
+                for (int j = i + 1; j < nano_lineCount - 1; j++) {
+                    nano_lines[j] = nano_lines[j + 1];
+                }
+                nano_lineCount--;
+                nano_lines[nano_lineCount] = "";
+                i--; // Re-process this index, which now holds a new line
+            }
+        }
+    }
+
+    // 5. --- FINAL REDRAW ---
+    if (needsScrollCheck && nano_cursorLine < nano_topLine) {
+        nano_topLine = nano_cursorLine;
+    }
+
+    // Because multiple lines could have changed, we must redraw the text area.
+    if (!wasModified) {
+        nano_drawUI(); // Full UI redraw if it's the first modification
+    } else {
+        nano_drawTextArea(); // Otherwise, just the text area and footer
+        nano_drawFooter();
+    }
+    
+    nano_drawEditorCursor(); // Explicitly draw cursor at its new final position
+}
+/**
+ * @brief Redraws all visible lines from the specified fileLineIndex downwards.
+ * This is the flicker-free method for line insertion and merging.
+ */
+void nano_redrawVisibleLinesFrom(int fileLineIndex) {
+    int screenLine = fileLineIndex - nano_topLine;
+    
+    // Check if the starting line is visible in the viewport
+    if (screenLine < NANO_TEXT_AREA_LINES) {
+        // Start clearing and redrawing from the current line's screen position.
+        int startY = (NANO_HEADER_LINES + max(0, screenLine)) * LINE_HEIGHT;
+        
+        // Calculate the total height from this point to the bottom of the text area.
+        int clearHeight = (NANO_TEXT_AREA_LINES - max(0, screenLine)) * LINE_HEIGHT;
+        
+        // 1. Clear the entire area once
+        tft.fillRect(0, startY, SCREEN_WIDTH, clearHeight, ST77XX_BLACK);
+
+        // 2. Loop through and redraw all subsequent visible lines
+        for (int r = max(0, screenLine); r < NANO_TEXT_AREA_LINES; ++r) {
+            int lineIndex = nano_topLine + r;
+            
+            if (lineIndex < nano_lineCount) {
+                tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+                tft.setCursor(0, (NANO_HEADER_LINES + r) * LINE_HEIGHT);
+                tft.print(nano_lines[lineIndex].substring(0, COLS));
+            } else {
+                break; // Stop when we run out of lines in the buffer
+            }
+        }
+    }
+}
+void nano_insertLine() {
+    // Check if we can add another line
+    if (nano_lineCount >= NANO_MAX_LINES) {
+        return;
+    }
+
+    // Ensure cursor line is valid
+    if (nano_cursorLine < 0 || nano_cursorLine >= nano_lineCount) {
+        return;
+    }
+
+    // --- OPTIMIZATION: Check modified status BEFORE changing it ---
+    bool wasModified = nano_isModified;
+
+    String &currentLine = nano_lines[nano_cursorLine];
+    String textAfterCursor = currentLine.substring(nano_cursorCol); // Text to move to new line
+
+    // Truncate the current line at the cursor position
+    currentLine = currentLine.substring(0, nano_cursorCol);
+
+    // Shift lines down to make space for the new line
+    for (int i = nano_lineCount; i > nano_cursorLine + 1; --i) {
+        nano_lines[i] = nano_lines[i - 1];
+    }
+
+    // Insert the text after the cursor as the new line
+    nano_lines[nano_cursorLine + 1] = textAfterCursor;
+
+    nano_lineCount++;    // Increment total line count
+    nano_cursorLine++;   // Move cursor to the beginning of the new line
+    nano_cursorCol = 0;
+
+    nano_isModified = true; // Mark file as modified
+
+    // Handle scrolling if necessary (cursor moved down)
+    bool scrolled = false;
+    if (nano_cursorLine >= nano_topLine + NANO_TEXT_AREA_LINES) {
+        nano_topLine = nano_cursorLine - NANO_TEXT_AREA_LINES + 1;
+        scrolled = true;
+    }
+
+    // --- OPTIMIZED REDRAW ---
+    if (!wasModified || scrolled) {
+        // If this is the FIRST modification OR the viewport SCROLLED, do a full UI redraw.
+        nano_drawUI();
+    } else {
+        // It was already modified and the viewport didn't move.
+        // We only need to redraw the affected text area and the footer.
+        nano_redrawVisibleLinesFrom(nano_cursorLine - 1); // <-- NEW SURGICAL CALL
+        nano_drawFooter();
+    }
+    
+    // The main loop will handle the final cursor draw.
+}
+/**
+ * @brief Inserts a character at the cursor, handling both edge-of-screen
+ * wraps and mid-line reflows for all subsequent lines.
+ * @param c The character to insert.
+ * @return bool True if a multi-line redraw occurred, false otherwise.
+ */
+bool nano_insertChar_DataWorker(char c) {
+    bool didWrap = false;
+    
+    // Safety check
+    if (nano_cursorLine < 0 || nano_cursorLine >= nano_lineCount) {
+        return didWrap;
+    }
+
+    String &currentLine = nano_lines[nano_cursorLine]; 
+
+    // Check for hard character limit
+    if (currentLine.length() >= NANO_MAX_LINE_LEN) {
+        return didWrap;
+    }
+
+    // 2. Insert the character into the data
+    if (nano_cursorCol == currentLine.length()) {
+        currentLine += c;
+    } else {
+        String beginning = currentLine.substring(0, nano_cursorCol);
+        String end = currentLine.substring(nano_cursorCol);
+        currentLine = beginning + c + end;
+    }
+
+    nano_cursorCol++; 
+    nano_isModified = true;
+
+    // --- NEW ITERATIVE (LOOP-BASED) REFLOW LOGIC ---
+    // 3. Check if the insertion made the line too long
+    if (!didWrap && currentLine.length() > WRAP_COLS) {
+        
+        // This loop will start at the line we just changed
+        // and run down the file as long as lines keep overflowing.
+        for (int i = nano_cursorLine; i < nano_lineCount; i++) {
+            
+            String &line = nano_lines[i];
+            
+            // 4. If this line is fine, the waterfall stops.
+            if (line.length() <= WRAP_COLS) {
+                break; // <-- Stop the loop
+            }
+            
+            // 5. This line is too long. Split it.
+            String overflowText = line.substring(WRAP_COLS);
+            line = line.substring(0, WRAP_COLS); // Truncate current line
+
+            // 6. Now, add the overflow to the *next* line (i + 1)
+            if (i + 1 >= NANO_MAX_LINES) {
+                // We're at the max buffer size, text is lost.
+                break; // <-- Stop the loop
+            }
+
+            // Check if we're on the last line of the file
+            if (i + 1 == nano_lineCount) {
+                // We need to add a new line
+                if (nano_lineCount < NANO_MAX_LINES) {
+                    nano_lineCount++;
+                    nano_lines[i + 1] = overflowText;
+                } else {
+                    // No more room in the buffer, stop.
+                    break; // <-- Stop the loop
+                }
+            } else {
+                // We're in the middle of the file, prepend to the existing next line
+                String &nextLine = nano_lines[i + 1];
+                nextLine = overflowText + nextLine;
+
+                // Enforce the hard data limit (NANO_MAX_LINE_LEN)
+                if (nextLine.length() > NANO_MAX_LINE_LEN) {
+                    nextLine = nextLine.substring(0, NANO_MAX_LINE_LEN);
+                }
+            }
+            
+            // The loop will now continue (i++) and check the line we just modified
+        }
+        
+        // 7. After the loop, do a multi-line redraw and set the flag
+        nano_redrawVisibleLinesFrom(nano_cursorLine);
+        didWrap = true; // Tell nano_insertChar we handled the redraw
+        if (nano_cursorCol > WRAP_COLS) {
+            nano_cursorLine++; // Move cursor to the next line
+            nano_cursorCol = nano_cursorCol - WRAP_COLS; // e.g., 41 - 40 = 1
+
+            // Handle scrolling if the cursor just moved off-screen
+            if (nano_cursorLine >= nano_topLine + NANO_TEXT_AREA_LINES) {
+                nano_topLine++;
+                // A scroll occurred, the partial redraw isn't enough.
+                nano_drawTextArea();
+            }
+        }
+    }
+    // --- END OF NEW LOGIC ---
+
+    return didWrap; // Return whether a redraw occurred
+}
+void nano_redrawTrailingText() {
+    // 1. Calculate the cursor's exact screen position (x, y)
+    int screenLine = nano_cursorLine - nano_topLine;
+    if (screenLine < 0 || screenLine >= NANO_TEXT_AREA_LINES) {
+        return; // Don't draw if the line isn't visible
+    }
+    int cursorScreenX = nano_cursorCol * CHAR_WIDTH;
+    int cursorScreenY = (NANO_HEADER_LINES + screenLine) * LINE_HEIGHT;
+
+    // 2. Clear the screen area only from the cursor to the right edge
+    tft.fillRect(cursorScreenX, cursorScreenY, SCREEN_WIDTH - cursorScreenX, LINE_HEIGHT, ST77XX_BLACK);
+
+    // 3. Redraw the trailing text on the current line
+    String currentLine = nano_lines[nano_cursorLine];
+    if (nano_cursorCol < currentLine.length()) {
+        String trailingText = currentLine.substring(nano_cursorCol);
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(cursorScreenX, cursorScreenY);
+        tft.print(trailingText);
+    }
+    // Note: This function does NOT draw the cursor itself. That is handled by the main loop.
+    
+}
+void nano_insertChar(char c) {
+    // 1. Get the cursor's screen position BEFORE the text is changed
+    int screenLine = nano_cursorLine - nano_topLine;
+    int cursorScreenX = nano_cursorCol * CHAR_WIDTH;
+    int cursorScreenY = (NANO_HEADER_LINES + screenLine) * LINE_HEIGHT;
+
+    // 2. Call the data worker to update the text buffer
+    bool wrapOccurred = nano_insertChar_DataWorker(c); // <-- CAPTURE RETURN VALUE
+
+    // 3. ONLY draw if the worker did NOT perform a wrap
+    if (!wrapOccurred && screenLine >= 0 && screenLine < NANO_TEXT_AREA_LINES) {
+        // Step A: Draw ONLY the new character at the old cursor position
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(cursorScreenX, cursorScreenY);
+        tft.print(c);
+
+        // Step B: Call the trailing text function to shift the rest of the line
+        nano_redrawTrailingText();
+    }
+    
+    // 4. Update the header to show the '*' modified status
+    // (This is safe to run always, as nano_insertLine doesn't update it)
+    nano_drawHeader();
+}
+String findFileCaseInsensitive(const String& filename) {
+    if (!fsReady) {
+        return filename; // FS not ready, just return original name
+    }
+
+    File root = LittleFS.open("/", "r");
+    if (!root) {
+        return filename; // Can't open root, return original name
+    }
+
+    File file = root.openNextFile();
+    while (file) {
+        String currentFileName = file.name();
+        
+        // Check if the names match, ignoring case
+        if (currentFileName.equalsIgnoreCase(filename)) {
+            file.close();
+            root.close();
+            return currentFileName; // Return the *actual* cased name
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    return filename; // No match found, return original name
+}
+bool nano_loadFile(const String& filename) {
+    nano_lineCount = 0; // Reset line count
+
+    // Use findFileCaseInsensitive to get the actual filename
+    String actualFilename = findFileCaseInsensitive(filename);
+
+    if (!LittleFS.exists(actualFilename)) {
+        // File doesn't exist, treat as a new empty file
+        nano_lineCount = 1; nano_lines[0] = "";
+        return false;
+    }
+
+    File file = LittleFS.open(actualFilename, "r");
+    if (!file) {
+        pushSystemMessage("Error: Failed to open file: " + actualFilename);
+        nano_lineCount = 1; nano_lines[0] = "";
+        return false;
+    }
+
+    // Read file line by line
+    while (file.available() && nano_lineCount < NANO_MAX_LINES) {
+        String original_line = file.readStringUntil('\n');
+        
+        if (original_line.endsWith("\r")) {
+            original_line.remove(original_line.length() - 1);
+        }
+
+        // --- NEW UTF-8 DECODING & ASCII SUBSTITUTION LOGIC ---
+        String cleaned_line = ""; // Build the ASCII-fied line here
+        int len = original_line.length();
+        for (int i = 0; i < len; ++i) {
+            unsigned char c1 = original_line.charAt(i);
+
+            if (c1 < 0x80) { // Standard ASCII (0xxxxxxx)
+                cleaned_line += (char)c1;
+            } else if ((c1 & 0xE0) == 0xC0) { // Start of 2-byte sequence (110xxxxx)
+                if (i + 1 < len) {
+                    unsigned char c2 = original_line.charAt(i + 1);
+                    if ((c2 & 0xC0) == 0x80) { // Check for continuation byte (10xxxxxx)
+                        uint16_t code_point = ((c1 & 0x1F) << 6) | (c2 & 0x3F);
+                        // Add substitutions for 2-byte sequences if needed
+                        switch (code_point) {
+                           case 0xA3: cleaned_line += '?'; break; // £ Pound
+                           case 0xA9: cleaned_line += "(c)"; break; // © Copyright
+                           // Add more common Latin-1 extended chars if needed
+                           default: cleaned_line += '?'; break; // Default for other 2-byte
+                        }
+                        i++; // Skip the next byte
+                    } else {
+                        cleaned_line += '?'; // Invalid sequence
+                    }
+                } else {
+                    cleaned_line += '?'; // Incomplete sequence
+                }
+            } else if ((c1 & 0xF0) == 0xE0) { // Start of 3-byte sequence (1110xxxx)
+                if (i + 2 < len) {
+                    unsigned char c2 = original_line.charAt(i + 1);
+                    unsigned char c3 = original_line.charAt(i + 2);
+                    if (((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80)) {
+                        uint32_t code_point = ((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
+                        // Add specific substitutions
+                        switch (code_point) {
+                            case 0x2018: cleaned_line += '\''; break; // ‘ Left single quote
+                            case 0x2019: cleaned_line += '\''; break; // ’ Right single quote
+                            case 0x201C: cleaned_line += '"'; break; // “ Left double quote
+                            case 0x201D: cleaned_line += '"'; break; // ” Right double quote
+                            case 0x2013: cleaned_line += '-'; break; // – En dash
+                            case 0x2014: cleaned_line += "--"; break; // — Em dash
+                            case 0x2026: cleaned_line += "..."; break; // … Ellipsis
+                            case 0x20AC: cleaned_line += '?'; break; // € Euro sign
+                            // Add more 3-byte substitutions if desired
+                            default: cleaned_line += '?'; break; // Default for other 3-byte
+                        }
+                        i += 2; // Skip next two bytes
+                    } else {
+                        cleaned_line += '?'; // Invalid sequence
+                    }
+                } else {
+                    cleaned_line += '?'; // Incomplete sequence
+                }
+            } else if ((c1 & 0xF8) == 0xF0) { // Start of 4-byte sequence (11110xxx)
+                 if (i + 3 < len) {
+                     unsigned char c2 = original_line.charAt(i + 1);
+                     unsigned char c3 = original_line.charAt(i + 2);
+                     unsigned char c4 = original_line.charAt(i + 3);
+                     if (((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80) && ((c4 & 0xC0) == 0x80)) {
+                         cleaned_line += '?'; // Substitute all 4-byte sequences
+                         i += 3; // Skip next three bytes
+                     } else {
+                         cleaned_line += '?'; // Invalid sequence
+                     }
+                 } else {
+                    cleaned_line += '?'; // Incomplete sequence
+                 }
+            } else {
+                // Invalid start byte or continuation byte found unexpectedly
+                cleaned_line += '?';
+            }
+        } // end for loop iterating through bytes
+        // --- END UTF-8 DECODING & ASCII SUBSTITUTION LOGIC ---
+
+
+        // --- WORD-WRAPPING LOGIC (uses the 'cleaned_line') ---
+        String line_to_wrap = cleaned_line; // Use the processed line
+        do {
+            if (nano_lineCount >= NANO_MAX_LINES) break; // Buffer is full
+
+            if (line_to_wrap.length() > WRAP_COLS) {
+                int wrapPoint = -1;
+                for (int i = WRAP_COLS; i > 0; i--) {
+                    if (line_to_wrap.charAt(i) == ' ') {
+                        wrapPoint = i;
+                        break;
+                    }
+                }
+                if (wrapPoint > 0) {
+                    nano_lines[nano_lineCount++] = line_to_wrap.substring(0, wrapPoint);
+                    line_to_wrap = line_to_wrap.substring(wrapPoint + 1); 
+                } else {
+                    nano_lines[nano_lineCount++] = line_to_wrap.substring(0, WRAP_COLS);
+                    line_to_wrap = line_to_wrap.substring(WRAP_COLS);
+                }
+            } else {
+                nano_lines[nano_lineCount++] = line_to_wrap;
+                line_to_wrap = ""; // Stop the loop
+            }
+        } while (line_to_wrap.length() > 0 && nano_lineCount < NANO_MAX_LINES);
+        // --- END WORD-WRAPPING LOGIC ---
+    } // end while loop reading lines
+
+    if (file.available()) {
+        pushSystemMessage("Warning: File exceeds max lines (" + String(NANO_MAX_LINES) + "). Truncated.");
+    }
+
+    file.close();
+    
+    if (nano_lineCount == 0) {
+        nano_lineCount = 1; nano_lines[0] = "";
+    }
+
+    return true; // Loading successful
+}
+bool nano_saveFile() {
+    // Attempt to open the file for writing (overwrite mode)
+    File file = LittleFS.open(nano_filename, "w");
+    if (!file) {
+        // Could show an error message in the status bar or via pushSystemMessage
+        return false; // Failed to open file for writing
+    }
+
+    // Write each line from the buffer to the file
+    for (int i = 0; i < nano_lineCount; ++i) {
+        if (file.println(nano_lines[i]) == 0) {
+            // Write failed (e.g., filesystem full?)
+            file.close();
+            // Show error message
+            return false;
+        }
+    }
+
+    file.close(); // Ensure file is closed after writing
+    nano_isModified = false; // Mark file as saved (not modified)
+    // Optional: Update header immediately to remove '*'
+    nano_drawHeader();
+    return true; // Saving successful
+}
+void nano_handleInput(int buttonIndex) {
+    bool redrawUI = false;
+    bool redrawTextArea = false; // Flag if only text area needs redraw (e.g., scroll)
+    bool redrawCursor = true;    // Most actions require text cursor redraw (unless focus changes)
+    bool requiresKeyboardRedraw = false; // Flag if kbPrev/kbNext/mode change occurred
+
+    // --- Action based on current focus ---
+    switch (nano_focus) {
+        case FOCUS_TEXT:
+            // --- Input Handling for Text Area ---
+            if (buttonIndex == IDX_PREV) { // Virtual Keyboard PREVIOUS
+                kbPrev(); // Cycle virtual keyboard selection
+                requiresKeyboardRedraw = true; // Need to update the preview
+                redrawCursor = false; // Cursor position doesn't change
+            }
+            else if (buttonIndex == IDX_NEXT) { // Virtual Keyboard NEXT
+                kbNext(); // Cycle virtual keyboard selection
+                requiresKeyboardRedraw = true; // Need to update the preview
+                redrawCursor = false; // Cursor position doesn't change
+            }
+            else if (buttonIndex == IDX_BACK) { // BACKSPACE
+                nano_backspace();
+                redrawUI = false;       // Prevent any full UI redraw
+                redrawCursor = true;
+                    // Backspace now needs to redraw the cursor at its new spot
+                 // ...
+            }
+            else if (buttonIndex == IDX_SELECT) { // CONFIRM Virtual Keyboard Selection or Action
+
+                // --- VIRTUAL KEYBOARD CONFIRM LOGIC ---
+                char charToInsert = 0;
+                String controlAction = "";
+                bool isCtrlAction = false; // Flag if a CTRL key (like arrows) was selected
+
+                const int ALPHA_CASE_KEY_INDEX = (int)strlen(alphaChars) + 1;
+                const int NUM_KEY_INDEX_SPACE = (int)strlen(numberChars) + 1;
+                const int SYM_KEY_INDEX_SPACE = (int)strlen(symbolChars) + 1;
+
+                if (kbIndex == 0) { // Mode Switch
+                    if (kmode == ALPHA || kmode == ALPHA_LOWER) kmode = NUM;
+                    else if (kmode == NUM) kmode = SYM;
+                    else if (kmode == SYM) kmode = CTRL; // Add CTRL mode cycle
+                    else if (kmode == CTRL) kmode = ALPHA; // Cycle back
+                    else kmode = ALPHA;
+
+                    kbIndex = 0;
+                    requiresKeyboardRedraw = true;
+                    redrawCursor = false;
+                    f1_copy_index = 0;
+                }
+                // Determine charToInsert or controlAction based on kmode and kbIndex
+                 else if (kmode == ALPHA) {
+                    if (kbIndex <= (int)strlen(alphaChars)) charToInsert = alphaChars[kbIndex - 1];
+                    else if (kbIndex == ALPHA_CASE_KEY_INDEX) controlAction = "SPACE";
+                    else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) controlAction = "ENTER";
+                    else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { // CASE switch
+                        kmode = ALPHA_LOWER; kbIndex = ALPHA_CASE_KEY_INDEX + 2;
+                        requiresKeyboardRedraw = true; redrawCursor = false;
+                    }
+                 }
+                 else if (kmode == ALPHA_LOWER) {
+                     if (kbIndex <= (int)strlen(alphaLowerChars)) charToInsert = alphaLowerChars[kbIndex - 1];
+                     else if (kbIndex == ALPHA_CASE_KEY_INDEX) controlAction = "SPACE";
+                     else if (kbIndex == ALPHA_CASE_KEY_INDEX + 1) controlAction = "ENTER";
+                     else if (kbIndex == ALPHA_CASE_KEY_INDEX + 2) { // case switch
+                         kmode = ALPHA; kbIndex = ALPHA_CASE_KEY_INDEX + 2;
+                         requiresKeyboardRedraw = true; redrawCursor = false;
+                     }
+                 }
+                 else if (kmode == NUM) {
+                     if (kbIndex <= (int)strlen(numberChars)) charToInsert = numberChars[kbIndex - 1];
+                     else if (kbIndex == NUM_KEY_INDEX_SPACE) controlAction = "SPACE";
+                     else if (kbIndex == NUM_KEY_INDEX_SPACE + 1) controlAction = "ENTER";
+                 }
+                 else if (kmode == SYM) {
+                     if (kbIndex <= (int)strlen(symbolChars)) charToInsert = symbolChars[kbIndex - 1];
+                     else if (kbIndex == SYM_KEY_INDEX_SPACE) controlAction = "SPACE";
+                     else if (kbIndex == SYM_KEY_INDEX_SPACE + 1) controlAction = "ENTER";
+                 }
+                 else if (kmode == CTRL) { // Check CTRL actions
+                    if (kbIndex > 0 && kbIndex <= CTRL_COUNT) {
+                        controlAction = ctrlKeys[kbIndex - 1];
+                        isCtrlAction = true; // Mark this as a control action
+                    }
+                    // Ignore FUNC key
+                 }
+                // --- End determine action ---
+
+
+                // --- Execute Action ---
+                if (charToInsert != 0) {
+                    bool wasModified = nano_isModified;
+                    // 1. Silently update the text buffer (no drawing)
+                    nano_insertChar(charToInsert); 
+                    // 2. Redraw only the part of the line that changed
+                    // 3. Update the header for the '*' modified status
+                    if (!wasModified) {
+                        nano_drawHeader();
+                    }
+                    // 4. Schedule the cursor to be drawn over the new text
+                    redrawCursor = true; 
+                    f1_copy_index = 0;
+                } else if (controlAction.length() > 0) {
+                    if (isCtrlAction) { // Handle CTRL keys (Arrows, Delete, etc.)
+                        if (controlAction == "LEFT") {
+                            nano_moveCursor(-1, 0); // Move left
+                        } else if (controlAction == "RIGHT") {
+                            nano_moveCursor(1, 0); // Move right
+                        } else if (controlAction == "UP") {
+                            if (nano_cursorLine == 0 && nano_topLine == 0) {
+                                nano_focus = FOCUS_HEADER; // Move focus to HEADER
+                                redrawUI = true;
+                                redrawCursor = false;
+                            } else {
+                                nano_moveCursor(0, -1); // Move up
+                            }
+                        } else if (controlAction == "DOWN") {
+                            if (nano_cursorLine == nano_lineCount - 1) {
+                                 nano_focus = FOCUS_FOOTER; // Move focus to FOOTER
+                                 nano_footerSelection = 0;
+                                 redrawUI = true;
+                                 redrawCursor = false;
+                             } else {
+                                 nano_moveCursor(0, 1); // Move down
+                             }
+                        } else if (controlAction == "DELETE") {
+                             // Forward delete not implemented
+                             redrawCursor = false;
+                        } else if (controlAction == "SPACE") { // Space/Enter were part of CTRL layer
+                           isCtrlAction = false;
+                        } else if (controlAction == "ENTER") {
+                           isCtrlAction = false;
+                        }
+                    }
+
+                    // Handle non-CTRL actions (or SPACE/ENTER)
+                    if (!isCtrlAction) {
+                        if (controlAction == "SPACE") {
+                            nano_insertChar(' ');
+                            nano_redrawTrailingText();
+                            redrawCursor = true;
+
+                            f1_copy_index = 0;
+                        } else if (controlAction == "ENTER") {
+                            nano_insertLine();
+                            redrawCursor = true;
+                            f1_copy_index = 0;
+                        }
+                    }
+                }
+                // --- End Execute Action ---
+            } // End IDX_SELECT handling
+
+            break; // End FOCUS_TEXT case
+
+        case FOCUS_HEADER:
+            // --- Input Handling for Header Bar ---
+            if (buttonIndex == IDX_NEXT) { // DOWN
+                nano_focus = FOCUS_TEXT;
+                redrawUI = true;
+                redrawCursor = true;
+            } else {
+                 redrawCursor = false; // No cursor action
+            }
+            break; // End FOCUS_HEADER case
+
+        case FOCUS_FOOTER:
+            // --- Input Handling for Footer Bar ---
+            redrawCursor = false; // No text cursor
+            if (buttonIndex == IDX_PREV) { // UP
+                nano_focus = FOCUS_TEXT;
+                redrawUI = true;
+                redrawCursor = true;
+            } else if (buttonIndex == IDX_BACK) { // LEFT
+                nano_footerSelection--;
+                if (nano_footerSelection < 0) nano_footerSelection = 1; // Wrap (assuming 2 options: 0=Save, 1=Exit)
+                nano_drawFooter(); // Redraw footer only
+            } else if (buttonIndex == IDX_NEXT) { // RIGHT
+                 nano_footerSelection++;
+                 if (nano_footerSelection > 1) nano_footerSelection = 0; // Wrap
+                 nano_drawFooter(); // Redraw footer only
+            } else if (buttonIndex == IDX_SELECT) { // SELECT action
+                if (nano_footerSelection == 0) { // Action: SAVE
+                    if (nano_saveFile()) {
+                        nano_isModified = false;
+                        pushSystemMessage("File Saved: " + nano_filename);
+                    } else {
+                         pushSystemMessage("Error Saving File!");
+                    }
+                    nano_focus = FOCUS_TEXT; redrawUI = true; redrawCursor = true;
+                } else if (nano_footerSelection == 1) { // Action: EXIT
+                     if (nano_isModified) {
+                         // File is modified, enter confirmation state
+                         nano_focus = NANO_AWAIT_SAVE_CONFIRM;
+                         nano_saveConfirmSelection = 0; // Default to 'Y'
+                         redrawUI = true; // Redraw footer to show prompt
+                         redrawCursor = false;
+                     } else {
+                         // Not modified, exit immediately
+                         nano_exitRequested = true;
+                     }
+                }
+            }
+            break; // End FOCUS_FOOTER case
+
+        // *** CASE FOR SAVE CONFIRMATION ***
+        case NANO_AWAIT_SAVE_CONFIRM:
+            redrawCursor = false; // No text cursor
+            if (buttonIndex == IDX_BACK) { // LEFT
+                nano_saveConfirmSelection--;
+                if (nano_saveConfirmSelection < 0) nano_saveConfirmSelection = 1; // Wrap Y <-> N
+                nano_drawFooter(); // Redraw prompt to show new selection
+            } else if (buttonIndex == IDX_NEXT) { // RIGHT
+                nano_saveConfirmSelection++;
+                if (nano_saveConfirmSelection > 1) nano_saveConfirmSelection = 0; // Wrap Y <-> N
+                nano_drawFooter(); // Redraw prompt
+            } else if (buttonIndex == IDX_SELECT) { // CONFIRM Y or N
+                if (nano_saveConfirmSelection == 0) { // User selected 'Y'
+                    if (!nano_saveFile()) {
+                        pushSystemMessage("Error Saving File! Exit aborted.");
+                        nano_focus = FOCUS_TEXT; // Go back to text editing
+                        redrawUI = true;
+                        redrawCursor = true;
+                        // Do NOT set nano_exitRequested
+                    } else {
+                        nano_isModified = false; // File is now saved
+                        pushSystemMessage("File Saved. Exiting.");
+                        nano_exitRequested = true; // Set flag to exit runNanoEditor loop
+                    }
+                } else { // User selected 'N'
+                    pushSystemMessage("Exiting without saving.");
+                    nano_exitRequested = true; // Set flag to exit runNanoEditor loop
+                }
+                // Don't redraw here, runNanoEditor loop handles exit and terminal restore
+            }
+            // Ignore UP (IDX_PREV) while confirming save
+            break; // End NANO_AWAIT_SAVE_CONFIRM case
+        // *** END SAVE CONFIRM CASE ***
+
+    } // End switch(nano_focus)
+
+    // --- Perform Redraws based on flags ---
+    if (redrawUI) {
+        nano_drawUI(); // Full redraw
+        if (nano_focus == FOCUS_TEXT) nano_drawEditorCursor();
+    } else if (redrawTextArea) {
+        nano_drawTextArea(); // Redraw text area only (scroll)
+        if (nano_focus == FOCUS_TEXT) nano_drawEditorCursor();
+    } else if (requiresKeyboardRedraw) {
+        nano_drawFooter(); // Redraw footer for keyboard preview
+        if (nano_focus == FOCUS_TEXT) nano_drawEditorCursor(); // Ensure text cursor still visible
+    } else if (redrawCursor && nano_focus == FOCUS_TEXT) {
+        nano_drawEditorCursor(); // Redraw text cursor only
+    }
+}
 uint32_t read32(File &f) {
   uint32_t result;
   uint8_t buffer[4];
@@ -348,9 +1653,6 @@ uint16_t hsvToRgb565(int hue, uint8_t sat, uint8_t val) {
     // Convert 8-bit R,G,B to 16-bit RGB565
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
-
-// *** 3D CUBE IMPLEMENTATION ***
-
 Point3D rotateX(Point3D p, float angle) {
     float rad = angle * PI / 180.0;
     float cosA = cos(rad);
@@ -371,14 +1673,10 @@ Point3D rotateZ(Point3D p, float angle) {
     float sinA = sin(rad);
     return {p.x * cosA - p.y * sinA, p.x * sinA + p.y * cosA, p.z};
 }
-
-// --- 3D to 2D Projection ---
 Point project(Point3D p) {
     // Simple orthographic projection
     return Point((int)(p.x + SCREEN_WIDTH / 2), (int)(p.y + SCREEN_HEIGHT / 2));
 }
-
-// --- Drawing the Cube ---
 void drawRotatingCube(Point* projected_points, uint16_t color) {
     // Edges of the cube
     int edges[12][2] = {
@@ -500,7 +1798,6 @@ void mood() {
     invalidateTerminalCache(); // Clear the visual cache
     drawFullTerminal();        // Force a full redraw of the terminal
 }
-
 void drawMoon(int day, int totalDays) {
     int cx = SCREEN_WIDTH / 2;
     int cy = SCREEN_HEIGHT / 2 - 20; // Move moon up to make space for text
@@ -573,10 +1870,6 @@ void drawMoon(int day, int totalDays) {
 
     tft.setTextSize(1);
 }
-/**
- * @brief Enters a dedicated loop to display and control the moon phase viewer.
- * Exits when the BACK button is pressed.
- */
 void runMoonPhase() {
     int currentDay = 0; // Start at Day 0 (New Moon)
     const int totalDays = 30;
@@ -1670,7 +2963,7 @@ void kbPrev() {
             formatIndex = 1; 
         }
         // NOTE: drawCursorAndPreview() must be updated to use formatIndex
-        drawCursorAndPreview(); 
+        if (!isNanoActive) drawCursorAndPreview();
         return; 
     }
     kbIndex--;
@@ -1685,6 +2978,7 @@ void kbPrev() {
         // Max index for FUNC_VIEW is [F12] (index 12)
         else if (kmode == FUNC_VIEW) kbIndex = FUNC_COUNT;
     }
+    if (!isNanoActive) drawCursorAndPreview();
 }
 void kbNext() {
     if (fkeyState == F_AWAIT_FORMAT_CONFIRM) {
@@ -1695,7 +2989,7 @@ void kbNext() {
             formatIndex = 0; 
         }
         // NOTE: drawCursorAndPreview() must be updated to use formatIndex
-        drawCursorAndPreview(); 
+        if (!isNanoActive) drawCursorAndPreview();
         return;
     }
     int maxIndex = 0;
@@ -1723,7 +3017,7 @@ void kbNext() {
     if (kbIndex > maxIndex) {
         kbIndex = 0;
     }
-    drawCursorAndPreview();
+    if (!isNanoActive) drawCursorAndPreview();
 }
 void kbConfirm() {
     char charToInsert = 0;
@@ -2071,7 +3365,16 @@ void kbConfirm() {
         else if (controlAction == "RIGHT") {
             if (cursorPos < cmdLen) cursorPos++;
         }
-        
+        else if (controlAction == "UP") {
+            historyRecallUp(); // Call history function
+            drawFullTerminal();
+            return; // Exit early, no need for final drawCursorAndPreview
+        }
+        else if (controlAction == "DOWN") {
+            historyRecallDown(); // Call history function
+            drawFullTerminal();
+            return;
+        }
         drawCursorAndPreview();
     }
 }
@@ -2463,6 +3766,7 @@ void executeCommandLine(const String &raw) {
         pushScrollback("ls           - List files on LittleFS.");
         pushScrollback("cat <file>   - Display file content.");
         pushScrollback("echo <text> >/>> <file> - Write file.");
+        pushScrollback("nano <file>  - Simple text editor.");
         pushScrollback("rm <file>    - Delete a file.");
         pushScrollback("send <file>  - Send file to PC via USB.");
         pushScrollback("format       - Format LT-FS partition.");
@@ -2526,7 +3830,7 @@ void executeCommandLine(const String &raw) {
         } else {
             pushSystemMessage(output);
         }
-
+    
     } else if (cmd == "time") {
         unsigned long uptime = (millis() - startMillis) / 1000;
         unsigned long seconds = uptime % 60;
@@ -2535,7 +3839,18 @@ void executeCommandLine(const String &raw) {
         char buf[32];
         sprintf(buf, "Uptime: %lu:%02lu:%02lu", hours, minutes, seconds);
         pushSystemMessage(String(buf));
-
+    } else if (cmd == "nano") { //
+        if (count < 2) { // Check if a filename was provided
+            pushSystemMessage("Usage: nano <filename>"); //
+        } else if (!fsReady) { // Check if the filesystem is available
+            pushSystemMessage("Error: LittleFS not available."); //
+        } else {
+            String filename_typed = tokens[1];
+            // Find the *actual* cased filename
+            String filename_actual = findFileCaseInsensitive(filename_typed);
+            runNanoEditor(filename_actual); // Open the file
+            return; // Exit executeCommandLine early
+        }
     } else if (cmd == "calc") {
         if (count < 2) {
             pushSystemMessage("Usage: calc <expression>");
@@ -2591,13 +3906,18 @@ void executeCommandLine(const String &raw) {
 
     } else if (cmd == "cat") {
         if (count < 2) pushSystemMessage("Usage: cat <filename>");
-        else pushScrollback(readFile(tokens[1]));
-
+        else {
+            String filename_typed = tokens[1];
+            String filename_actual = findFileCaseInsensitive(filename_typed);
+            pushScrollback(readFile(filename_actual));
+        }
     } else if (cmd == "rm") {
         if (count < 2) pushSystemMessage("Usage: rm <filename>");
         else {
-            if (removeFile(tokens[1]))
-                pushSystemMessage("Deleted " + tokens[1] + ".");
+            String filename_typed = tokens[1];
+            String filename_actual = findFileCaseInsensitive(filename_typed);
+            if (removeFile(filename_actual))
+                pushSystemMessage("Deleted " + filename_actual + ".");
             else pushSystemMessage("Error: File not found or couldn't be deleted.");
         }
     } else if (cmd == "format") { 
@@ -3062,6 +4382,7 @@ void handleSerialCommands() {
                 // ----------------------------
                 
                 else {
+                    executeCommandLine(cmdLine);
                     pushSystemMessage("Error: Unknown command: " + cmdLine);
                     Serial.println("ERROR: Unknown command.");
                 }
@@ -3131,7 +4452,6 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    //Timer:
     if (timerEndTime > 0 && now >= timerEndTime) {
         timerEndTime = 0; // Deactivate the main timer
         lastTimerActiveBlink = 0; // Reset periodic blink timer
@@ -3144,16 +4464,51 @@ void loop() {
 
         drawFullTerminal(); // Force redraw to show the message immediately
     }
-    if (timerEndTime > 0) { // Check if timer is running
-        if (now - lastTimerActiveBlink >= TIMER_ACTIVE_BLINK_INTERVAL_MS) {
-            lastTimerActiveBlink = now; // Reset the interval timer
+    // --- End Timer Finished Check ---
 
-            // Start a SHORT blink (using existing mechanism)
-            ledBlinkEndTime = now + LED_BLINK_DURATION_MS; // Use the short duration
+    // *** NEW: Timer Finished Blinking Pattern Handler ***
+    if (timerFinishedBlinkEndTime > 0) { // Is the 10s blink period active?
+        if (now >= timerFinishedBlinkEndTime) {
+            // 10-second period is over
+            timerFinishedBlinkEndTime = 0;      // Deactivate the blinking period
+            digitalWrite(STATUS_LED_PIN, LOW); // Ensure LED finishes in OFF state
+        } else {
+            // Still within the 10-second period, check if it's time to toggle
+            if (now - lastFinishedBlinkToggle >= FINISHED_BLINK_INTERVAL_MS) {
+                // Toggle the LED state (read current state and write the opposite)
+                digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+                lastFinishedBlinkToggle = now; // Reset the toggle timer
+            }
+        }
+    }
+    // *** END Timer Finished Blinking Pattern Handler ***
+
+    // --- Periodic Blink While Timer Active (Existing - Unchanged) ---
+    if (timerEndTime > 0) { // Check if main timer is running
+        if (now - lastTimerActiveBlink >= TIMER_ACTIVE_BLINK_INTERVAL_MS) {
+            lastTimerActiveBlink = now;
+            // Start a SHORT blink (using ledBlinkEndTime)
+            ledBlinkEndTime = now + LED_BLINK_DURATION_MS;
             digitalWrite(STATUS_LED_PIN, HIGH);
         }
     }
+    // --- End Periodic Blink Check ---
 
+
+    // --- Cursor blinking (Existing - Unchanged) ---
+    if (now - lastBlink >= BLINK_MS) {
+        lastBlink = now;
+        cursorVisible = !cursorVisible;
+        drawCursorAndPreview();
+    }
+
+    // --- LED timeout (Existing - Handles SHORT periodic blinks only now) ---
+    // Make sure this doesn't interfere with the finished blink pattern
+    if (ledBlinkEndTime != 0 && now > ledBlinkEndTime && timerFinishedBlinkEndTime == 0) {
+        // Only turn off if the finished pattern is NOT active
+        digitalWrite(STATUS_LED_PIN, LOW);
+        ledBlinkEndTime = 0;
+    }
     // Cursor blinking
     if (now - lastBlink >= BLINK_MS) {
         lastBlink = now;
