@@ -206,7 +206,7 @@ void storeRainbowData(int scrollbackIndex, const String &s) {
 // ----------------------------
 // NANO EDITOR STATE
 // ----------------------------
-#define NANO_MAX_LINES 1000      // Max lines the editor can hold (RAM limit)
+#define NANO_MAX_LINES 1500      // Max lines the editor can hold (RAM limit)
 #define NANO_MAX_LINE_LEN 120   // Max characters per line (adjust based on RAM/performance)
 String nano_lines[NANO_MAX_LINES]; // Array to hold the text lines
 int nano_lineCount = 0;           // Number of lines currently in the buffer
@@ -303,6 +303,7 @@ void drawMoon(int day, int totalDays);
 void drawStars(); // Add this prototype
 void displayImage(const String& filename);
 bool nano_insertChar_DataWorker(char c);
+void splitAndWrapFile(const String& inputFilename);
 uint16_t read16(File &f);
 uint32_t read32(File &f);
 Point3D rotateX(Point3D p, float angle);
@@ -432,31 +433,76 @@ void runNanoEditor(String filename) {
 }
 void nano_drawHeader() {
     int y = 0; // Header is at the top row
-    // Prepare header text
-    String headerText = " File: " + nano_filename;
+
+    // --- 1. Calculate Page Numbers (Unchanged) ---
+    int currentPage = 1;
+    int totalPages = 1;
+    if (NANO_TEXT_AREA_LINES > 0) {
+        totalPages = (nano_lineCount + NANO_TEXT_AREA_LINES - 1) / NANO_TEXT_AREA_LINES;
+        if (totalPages == 0) totalPages = 1;
+        currentPage = (nano_topLine / NANO_TEXT_AREA_LINES) + 1;
+        if (currentPage > totalPages) currentPage = totalPages;
+    }
+
+    // --- 2. Format Header Text Parts ---
+    String pageInfo = "P. " + String(currentPage) + "/" + String(totalPages);
+    String fileLabel = " File:"; // <-- SEPARATE LABEL
+    // Filename part *without* the label initially
+    String fileNamePart = " " + nano_filename;
     if (nano_isModified) {
-        headerText += " *"; // Add asterisk if modified
+        fileNamePart += " *";
     }
 
-    // Set colors based on focus
+    // Calculate available space for file info (label + name + *)
+    int availableWidthForFile = COLS - pageInfo.length() - fileLabel.length();
+
+    // Truncate fileNamePart if necessary
+    if (fileNamePart.length() > availableWidthForFile) {
+        // Keep beginning, add "...", keep modification marker if needed
+        String modMarker = nano_isModified ? " *" : "";
+        int keepChars = availableWidthForFile - 3 - modMarker.length();
+        if (keepChars < 1) keepChars = 1; // Ensure at least one char before "..."
+        fileNamePart = fileNamePart.substring(0, keepChars) + "..." + modMarker;
+    }
+
+    // Calculate padding spaces needed
+    String padding = "";
+    int currentLength = fileLabel.length() + fileNamePart.length() + pageInfo.length();
+    while (currentLength < COLS) {
+        padding += " ";
+        currentLength++;
+    }
+
+    // --- 3. Set Colors based on Focus (Unchanged) ---
     uint16_t bgColor = ST77XX_BLACK;
-    uint16_t fgColor = ST77XX_WHITE;
-    if (nano_focus == FOCUS_HEADER && cursorVisible) { // Invert colors if header focused and cursor ON
+    uint16_t defaultFgColor = ST77XX_WHITE; // Default foreground
+    uint16_t labelColor = ST77XX_GREEN;     // Specific color for the label
+
+    if (nano_focus == FOCUS_HEADER && cursorVisible) {
         bgColor = ST77XX_WHITE;
-        fgColor = ST77XX_BLACK;
+        defaultFgColor = ST77XX_BLACK;
+        // Keep label green even when inverted? Or make it black too?
+        // Let's make it black when inverted for consistency.
+        labelColor = ST77XX_BLACK;
     }
 
-    // Draw background and text
-    tft.fillRect(0, y, SCREEN_WIDTH, LINE_HEIGHT * NANO_HEADER_LINES, bgColor);
+    // --- 4. Draw Background and Text in Parts ---
+    tft.fillRect(0, y, SCREEN_WIDTH, LINE_HEIGHT * NANO_HEADER_LINES, bgColor); // Clear header
+
+    // Part 1: Draw the " File:" label in green
     tft.setCursor(0, y);
-    tft.setTextColor(fgColor, bgColor);
-    tft.print(headerText);
+    tft.setTextColor(labelColor, bgColor);
+    tft.print(fileLabel);
 
-    // Clear rest of the line (in case filename is short)
-    int textWidth = headerText.length() * CHAR_WIDTH;
-    if (textWidth < SCREEN_WIDTH) {
-        tft.fillRect(textWidth, y, SCREEN_WIDTH - textWidth, LINE_HEIGHT * NANO_HEADER_LINES, bgColor);
-    }
+    // Part 2: Draw the filename part in the default color
+    tft.setTextColor(defaultFgColor, bgColor); // Switch to default FG
+    tft.print(fileNamePart);
+
+    // Part 3: Draw the padding spaces
+    tft.print(padding);
+
+    // Part 4: Draw the page info
+    tft.print(pageInfo);
 }
 void nano_drawTextArea() {
     int startY = NANO_HEADER_LINES * LINE_HEIGHT; // Y position after the header
@@ -747,21 +793,54 @@ void nano_drawEditorCursor() {
     nano_wasCursorVisibleLast = cursorVisible;
 }
 void nano_moveCursor(int dx, int dy) {
-    int oldLine = nano_cursorLine; // Store old line for scrolling check
+    bool scrolled = false;
 
-    // --- 1. Update Line Position ---
-    if (dy != 0) {
-        nano_cursorLine += dy;
-        // Clamp cursor line within buffer bounds
-        if (nano_cursorLine < 0) {
-            nano_cursorLine = 0;
+    // --- 1. Handle Vertical Movement (Page Up/Down or Line Up/Down) ---
+    if (dy > 0) { // Moving Down
+        int bottomVisibleLine = nano_topLine + NANO_TEXT_AREA_LINES - 1;
+        
+        // Check if cursor is already at the bottom edge
+        if (nano_cursorLine >= bottomVisibleLine) {
+            // --- Page Down ---
+            int potentialNewTop = nano_topLine + NANO_TEXT_AREA_LINES;
+            // Clamp nano_topLine so the last line doesn't scroll above the bottom
+            nano_topLine = min(potentialNewTop, nano_lineCount - NANO_TEXT_AREA_LINES);
+            if (nano_topLine < 0) nano_topLine = 0; // Ensure it doesn't go negative
+
+            // Also move the cursor down by a page (or to the last line)
+            nano_cursorLine = min(nano_cursorLine + NANO_TEXT_AREA_LINES, nano_lineCount - 1);
+            
+            scrolled = true;
+        } else {
+            // --- Normal Line Down ---
+            nano_cursorLine += dy;
+            // Clamp cursor line within buffer bounds
+            if (nano_cursorLine >= nano_lineCount) {
+                nano_cursorLine = nano_lineCount - 1; 
+            }
         }
-        if (nano_cursorLine >= nano_lineCount) {
-            nano_cursorLine = nano_lineCount - 1; // Don't go past the last line
+    } else if (dy < 0) { // Moving Up
+        // Check if cursor is already at the top edge
+        if (nano_cursorLine <= nano_topLine) {
+            // --- Page Up ---
+            int potentialNewTop = nano_topLine - NANO_TEXT_AREA_LINES;
+            nano_topLine = max(0, potentialNewTop); // Clamp top line at 0
+
+            // Also move the cursor up by a page (or to the first line)
+            nano_cursorLine = max(0, nano_cursorLine - NANO_TEXT_AREA_LINES);
+            
+            scrolled = true;
+        } else {
+            // --- Normal Line Up ---
+            nano_cursorLine += dy;
+            // Clamp cursor line within buffer bounds
+            if (nano_cursorLine < 0) {
+                nano_cursorLine = 0;
+            }
         }
     }
 
-    // --- 2. Update Column Position ---
+    // --- 2. Handle Horizontal Movement ---
     if (dx != 0) {
         nano_cursorCol += dx;
         // Clamp column (initially, can go past end temporarily)
@@ -770,40 +849,27 @@ void nano_moveCursor(int dx, int dy) {
         }
         // Max column depends on the (potentially new) current line's length
         int currentLineLen = (nano_cursorLine < nano_lineCount) ? nano_lines[nano_cursorLine].length() : 0;
-        if (nano_cursorCol > currentLineLen) {
-            nano_cursorCol = currentLineLen;
+        // Allow cursor to go one position PAST the end for typing
+        if (nano_cursorCol > currentLineLen) { 
+             nano_cursorCol = currentLineLen;
         }
     }
 
     // --- 3. Adjust Column for Vertical Movement ---
     // If we moved vertically (dy != 0), clamp the column to the length of the new line.
-    // This handles moving up/down onto shorter or longer lines correctly.
     if (dy != 0) {
         int currentLineLen = (nano_cursorLine < nano_lineCount) ? nano_lines[nano_cursorLine].length() : 0;
-        if (nano_cursorCol > currentLineLen) {
+        // Allow cursor to go one position PAST the end for typing
+        if (nano_cursorCol > currentLineLen) { 
             nano_cursorCol = currentLineLen;
         }
     }
 
-    // --- 4. Handle Vertical Scrolling ---
-    bool scrolled = false;
-    // Scroll up? (Cursor moved above the top visible line)
-    if (nano_cursorLine < nano_topLine) {
-        nano_topLine = nano_cursorLine; // Make the cursor line the new top line
-        scrolled = true;
-    }
-    // Scroll down? (Cursor moved below the bottom visible line)
-    else if (nano_cursorLine >= nano_topLine + NANO_TEXT_AREA_LINES) {
-        // Make the cursor line the new bottom line
-        nano_topLine = nano_cursorLine - NANO_TEXT_AREA_LINES + 1;
-        scrolled = true;
-    }
-
-    // --- 5. Redraw if Scrolled ---
+    // --- 4. Redraw if Scrolled ---
     if (scrolled) {
         // If the viewport changed, redraw the entire text area
         nano_drawTextArea();
-        // The main input handler will redraw the cursor afterward
+        nano_drawHeader();
     }
 
     // The cursor itself will be redrawn by nano_handleInput or the main blink cycle
@@ -1196,6 +1262,188 @@ String findFileCaseInsensitive(const String& filename) {
     }
     root.close();
     return filename; // No match found, return original name
+}
+/**
+ * @brief Splits a text file into ~100KB parts, applying word wrapping.
+ * @param inputFilename The name of the file to split.
+ */
+/**
+ * @brief Splits a text file into ~100KB parts, applying word wrapping
+ * and UTF-8 substitution, correctly handling boundary conditions.
+ * @param inputFilename The name of the file to split.
+ */
+/**
+ * @brief Splits a text file into ~100KB parts, applying word wrapping
+ * and UTF-8 substitution, checking for available space.
+ * @param inputFilename The name of the file to split.
+ */
+void splitAndWrapFile(const String& inputFilename) {
+    const size_t TARGET_CHUNK_SIZE = 100 * 1024; // 100KB
+    const size_t REQUIRED_SPACE = TARGET_CHUNK_SIZE; // Minimum space needed for next chunk
+
+    String actualFilename = findFileCaseInsensitive(inputFilename);
+    if (!LittleFS.exists(actualFilename)) {
+        pushSystemMessage("Error: Input file not found: " + actualFilename);
+        return;
+    }
+
+    File inputFile = LittleFS.open(actualFilename, "r");
+    if (!inputFile) {
+        pushSystemMessage("Error: Could not open input file: " + actualFilename);
+        return;
+    }
+
+    pushSystemMessage("Splitting " + actualFilename + " into parts...");
+    drawFullTerminal();
+
+    int partNum = 1;
+    bool errorOccurred = false;
+    bool spaceErrorOccurred = false; // <-- NEW FLAG
+    String baseName = actualFilename;
+    int dotIndex = baseName.lastIndexOf('.');
+    if (dotIndex != -1) {
+        baseName = baseName.substring(0, dotIndex);
+    }
+
+    String pending_line_part = "";
+
+    while (inputFile.available() || pending_line_part.length() > 0) {
+
+        // --- Check Available Space ---
+        if (fsReady) {
+            size_t totalBytes = 0, usedBytes = 0;
+            #ifdef ESP32
+                totalBytes = LittleFS.totalBytes(); usedBytes = LittleFS.usedBytes();
+            #else // RP2040
+                FSInfo fs_info;
+                if (!LittleFS.info(fs_info)) {
+                    pushSystemMessage("Error: Could not get FS info to check space.");
+                    errorOccurred = true; break;
+                }
+                totalBytes = fs_info.totalBytes; usedBytes = fs_info.usedBytes;
+            #endif
+            size_t freeBytes = totalBytes - usedBytes;
+
+            if (freeBytes < REQUIRED_SPACE) {
+                String nextOutputFilename = baseName + String(partNum) + ".txt";
+                pushSystemMessage("Error: Not enough space for file: " + nextOutputFilename);
+                pushSystemMessage(" Available: " + String(freeBytes / 1024) + "KB, Needed: ~" + String(REQUIRED_SPACE / 1024) + "KB");
+                errorOccurred = true;
+                spaceErrorOccurred = true; // <-- SET SPECIFIC FLAG
+                break; // Exit outer loop
+            }
+        } else {
+             pushSystemMessage("Error: Filesystem not ready, cannot check space.");
+             errorOccurred = true; break;
+        }
+        // --- END Check Available Space ---
+
+        String outputFilename = baseName + String(partNum) + ".txt";
+        File outputFile = LittleFS.open(outputFilename, "w");
+        if (!outputFile) {
+            pushSystemMessage("Error: Could not create output file: " + outputFilename);
+            errorOccurred = true; break;
+        }
+
+        size_t currentChunkSize = 0;
+        bool chunkFull = false;
+
+        // --- Process pending data ---
+        if (pending_line_part.length() > 0) {
+            if (pending_line_part.length() + 1 > TARGET_CHUNK_SIZE) {
+                 pushSystemMessage("Error: Single wrapped line exceeds chunk size near part " + String(partNum));
+                 errorOccurred = true; outputFile.close(); LittleFS.remove(outputFilename); break;
+            }
+            if (outputFile.println(pending_line_part) > 0) {
+                currentChunkSize += pending_line_part.length() + 1;
+                pending_line_part = "";
+            } else {
+                pushSystemMessage("Error: Write failed for pending data in " + outputFilename);
+                errorOccurred = true; outputFile.close(); break;
+            }
+        }
+
+        // --- Fill the current chunk ---
+        while (currentChunkSize < TARGET_CHUNK_SIZE && inputFile.available()) {
+            String original_line = inputFile.readStringUntil('\n');
+            if (original_line.endsWith("\r")) { original_line.remove(original_line.length() - 1); }
+
+            // --- Apply UTF-8 Substitution ---
+            String cleaned_line = "";
+            // [COPY THE ENTIRE UTF-8 SUBSTITUTION for loop and switch statement HERE]
+             int len = original_line.length();
+             for (int i = 0; i < len; ++i) {
+                 unsigned char c1 = original_line.charAt(i);
+                 if (c1 < 0x80) { cleaned_line += (char)c1; }
+                  else if ((c1 & 0xE0) == 0xC0) { // 2-byte
+                       if(i+1 < len){ unsigned char c2=original_line.charAt(i+1); if((c2 & 0xC0)==0x80){ uint16_t cp=((c1 & 0x1F)<<6)|(c2 & 0x3F); switch(cp){ case 0xA3: cleaned_line+='?'; break; case 0xA9: cleaned_line+="(c)"; break; default: cleaned_line+='?'; break; } i++; } else { cleaned_line+='?';} } else { cleaned_line+='?';}
+                  } else if ((c1 & 0xF0) == 0xE0) { // 3-byte
+                       if(i+2 < len){ unsigned char c2=original_line.charAt(i+1); unsigned char c3=original_line.charAt(i+2); if(((c2 & 0xC0)==0x80)&&((c3 & 0xC0)==0x80)){ uint32_t cp=((c1 & 0x0F)<<12)|((c2 & 0x3F)<<6)|(c3 & 0x3F); switch(cp){ case 0x2018: cleaned_line+='\''; break; case 0x2019: cleaned_line+='\''; break; case 0x201C: cleaned_line+='"'; break; case 0x201D: cleaned_line+='"'; break; case 0x2013: cleaned_line+='-'; break; case 0x2014: cleaned_line+="--"; break; case 0x2026: cleaned_line+="..."; break; case 0x20AC: cleaned_line+='?'; break; default: cleaned_line+='?'; break; } i+=2; } else { cleaned_line+='?';} } else { cleaned_line+='?';}
+                  } else if ((c1 & 0xF8) == 0xF0) { // 4-byte
+                       if(i+3 < len){ unsigned char c2=original_line.charAt(i+1); unsigned char c3=original_line.charAt(i+2); unsigned char c4=original_line.charAt(i+3); if(((c2&0xC0)==0x80)&&((c3&0xC0)==0x80)&&((c4&0xC0)==0x80)){ cleaned_line+='?'; i+=3; } else { cleaned_line+='?';} } else { cleaned_line+='?';}
+                  } else { cleaned_line += '?'; }
+             } // end UTF-8 sub loop
+
+
+            // --- Apply Word Wrapping ---
+            String line_to_wrap = cleaned_line;
+            do {
+                String segment;
+                if (line_to_wrap.length() > WRAP_COLS) {
+                    int wrapPoint = -1;
+                    for (int i = WRAP_COLS; i > 0; i--) { if (line_to_wrap.charAt(i) == ' ') { wrapPoint = i; break; } }
+                    if (wrapPoint > 0) { segment = line_to_wrap.substring(0, wrapPoint); line_to_wrap = line_to_wrap.substring(wrapPoint + 1); }
+                    else { segment = line_to_wrap.substring(0, WRAP_COLS); line_to_wrap = line_to_wrap.substring(WRAP_COLS); }
+                } else { segment = line_to_wrap; line_to_wrap = ""; }
+
+                if (currentChunkSize + segment.length() + 1 > TARGET_CHUNK_SIZE) {
+                    pending_line_part = segment;
+                     if (line_to_wrap.length() > 0) {
+                          pending_line_part += "\n";
+                          if (pending_line_part.length() + line_to_wrap.length() < (2 * TARGET_CHUNK_SIZE)) {
+                               pending_line_part += line_to_wrap;
+                          } else {
+                               pushSystemMessage("Warning: Truncating extremely long pending line part.");
+                          }
+                     }
+                    chunkFull = true; break; // Exit wrapping loop
+                }
+
+                if (outputFile.println(segment) == 0) {
+                    pushSystemMessage("Error: Write failed for " + outputFilename);
+                    errorOccurred = true; chunkFull = true; break; // Exit wrapping loop
+                }
+                currentChunkSize += segment.length() + 1;
+
+            } while (line_to_wrap.length() > 0);
+
+            if (chunkFull || errorOccurred) { break; } // Exit middle while loop
+        } // end while (currentChunkSize < TARGET_CHUNK_SIZE...)
+
+        // --- Finalize this chunk ---
+        outputFile.close();
+        if (currentChunkSize > 0 && !errorOccurred) {
+             pushSystemMessage("Created: " + outputFilename + " (" + String(currentChunkSize) + " bytes)");
+             drawFullTerminal();
+        }
+
+        if (errorOccurred) break;
+
+        partNum++;
+        delay(10); yield();
+
+    } // end outer while
+
+    inputFile.close();
+
+    // --- MODIFIED FINAL MESSAGES ---
+    if (!errorOccurred) {
+        pushSystemMessage("File splitting complete.");
+    } else if (!spaceErrorOccurred) { // <-- Check specific flag
+        // Only show generic error if it wasn't the space error
+        pushSystemMessage("File splitting stopped due to errors.");
+    }
+    // If spaceErrorOccurred is true, the specific message was already printed.
 }
 bool nano_loadFile(const String& filename) {
     nano_lineCount = 0; // Reset line count
@@ -3780,6 +4028,7 @@ void executeCommandLine(const String &raw) {
         pushScrollback("nano <file>  - Simple text editor.");
         pushScrollback("rm <file>    - Delete a file.");
         pushScrollback("send <file>  - Send file to PC via USB.");
+        pushScrollback("part <file>  - TXT into ~100KB parts.");
         pushScrollback("format       - Format LT-FS partition.");
         pushScrollback("df           - Disk usage information.");        
         pushScrollback("ver          - Display version info.");
@@ -3901,15 +4150,23 @@ void executeCommandLine(const String &raw) {
         } else if (!fsReady) {
             pushSystemMessage("Error: LittleFS not available.");
         } else {
-            String filename = tokens[1];
-            if (!filename.endsWith(".bmp")) { // Basic check
+            String filename_typed = tokens[1]; // Store typed name
+            String filename_actual = findFileCaseInsensitive(filename_typed); // Find actual name
+
+            // --- FIX IS HERE ---
+            // 1. Create a temporary lowercase version
+            String filename_lower = filename_actual; // Make a copy
+            filename_lower.toLowerCase(); // Convert the copy to lowercase
+
+            // 2. Check the extension on the lowercase copy
+            if (!filename_lower.endsWith(".bmp")) {
+            // --- END OF FIX ---
                 pushSystemMessage("Error: Only .bmp files supported.");
-            } else if (!LittleFS.exists(filename)) {
-                pushSystemMessage("Error: File not found: " + filename);
+            } else if (!LittleFS.exists(filename_actual)) { // Check actual name
+                pushSystemMessage("Error: File not found: " + filename_actual); // Show actual name
             } else {
-                displayImage(filename); // Call the display function
-                // NOTE: displayImage handles restoring the terminal
-                return; // Important: Don't redraw/clear command after image display
+                displayImage(filename_actual); // Display actual name
+                return;
             }
         }
     } else if (cmd == "ls") {
@@ -3930,6 +4187,20 @@ void executeCommandLine(const String &raw) {
             if (removeFile(filename_actual))
                 pushSystemMessage("Deleted " + filename_actual + ".");
             else pushSystemMessage("Error: File not found or couldn't be deleted.");
+        }
+    } else if (cmd == "part") {
+        if (count < 2) {
+            pushSystemMessage("Usage: part <filename.txt>");
+        } else if (!fsReady) {
+            pushSystemMessage("Error: LittleFS not available.");
+        } else {
+            String filename_typed = tokens[1];
+            // Call the new splitting function
+            splitAndWrapFile(filename_typed);
+            // Redraw terminal after the potentially long operation
+            drawFullTerminal();
+            clearCurrentCommand();
+            return; // Return because splitAndWrapFile handles messages
         }
     } else if (cmd == "format") { 
         if (!fsReady) {
