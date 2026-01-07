@@ -659,44 +659,103 @@ void HandleIncomingSend(const std::string& commandLine)
         Log("ERROR: File transfer incomplete. Expected " + std::to_string(filesize_s) + " bytes, got " + std::to_string(bytesReceived) + " bytes.");
     }
 }
-std::wstring FindPicoCOMPort()
+
+std::wstring FindPicoOrKeeboarCOMPort()
 {
+    // --- Define the Hardware IDs to search for ---
+
+    // Standard Raspberry Pi Pico
+    const wchar_t* PICO_HWID = L"VID_2E8A&PID_000A";
+
+    // Adafruit KB2040 (or similar Adafruit RP2040 boards in CDC mode)
+    // **IMPORTANT:** Verify this VID & PID in your Windows Device Manager!
+    // It's often VID_239A for Adafruit and PID_80F4 or similar for RP2040 CDC.
+    const wchar_t* KEEBOAR_HWID = L"VID_239A&PID_8105";
+
+    // --- Device Enumeration Setup ---
+
+    // Get a handle to a device information set for all present USB devices.
     HDEVINFO hDevInfo = SetupDiGetClassDevs(NULL, L"USB", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (hDevInfo == INVALID_HANDLE_VALUE) {
-        return L"";
+        // Failed to get device information set. You might want to log GetLastError() here.
+        return L""; // Return empty string indicating failure/not found
     }
 
-    SP_DEVINFO_DATA devInfoData;
-    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-    DWORD i = 0;
+    SP_DEVINFO_DATA devInfoData; // Structure to receive information about an enumerated device.
+    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA); // Set the size of the structure.
+    DWORD deviceIndex = 0; // Index for enumerating devices.
 
-    while (SetupDiEnumDeviceInfo(hDevInfo, i++, &devInfoData))
+    // --- Iterate Through Connected USB Devices ---
+
+    // Loop through all devices in the set.
+    while (SetupDiEnumDeviceInfo(hDevInfo, deviceIndex++, &devInfoData))
     {
-        wchar_t buffer[512];
-        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, (PBYTE)buffer, sizeof(buffer), NULL))
+        wchar_t hardwareIdBuffer[512]; // Buffer to hold the multi-string Hardware ID.
+
+        // Retrieve the Hardware ID property for the current device.
+        if (SetupDiGetDeviceRegistryPropertyW(
+            hDevInfo,               // Handle to the device information set.
+            &devInfoData,           // Pointer to the device information structure.
+            SPDRP_HARDWAREID,       // Property to retrieve (Hardware ID).
+            NULL,                   // Optional: pointer to receive the data type.
+            (PBYTE)hardwareIdBuffer,// Buffer to receive the Hardware ID.
+            sizeof(hardwareIdBuffer),// Size of the buffer.
+            NULL                    // Optional: pointer to receive required buffer size.
+        ))
         {
-            // The Pico's hardware ID is "VID_2E8A&PID_000A"
-            if (wcsstr(buffer, L"VID_2E8A&PID_000A") != NULL)
+            // --- Check if Hardware ID Matches Pico or Keeboar ---
+
+            // The Hardware ID is often a multi-string (multiple IDs null-terminated,
+            // with a final double null). wcsstr checks if our target ID exists anywhere within it.
+            if (wcsstr(hardwareIdBuffer, PICO_HWID) != NULL ||      // Check for Pico ID
+                wcsstr(hardwareIdBuffer, KEEBOAR_HWID) != NULL)   // Check for Keeboar ID
             {
-                HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
-                if (hKey != INVALID_HANDLE_VALUE)
+                // --- Found a Match: Get the COM Port Name ---
+
+                // Open the device's hardware registry key to read device parameters.
+                HKEY hDeviceRegistryKey = SetupDiOpenDevRegKey(
+                    hDevInfo,           // Handle to the device information set.
+                    &devInfoData,       // Pointer to the device information structure.
+                    DICS_FLAG_GLOBAL,   // Use the global profile.
+                    0,                  // Hardware profile (0 for current).
+                    DIREG_DEV,          // Open the device's hardware key.
+                    KEY_READ            // Request read access.
+                );
+
+                if (hDeviceRegistryKey != INVALID_HANDLE_VALUE)
                 {
-                    wchar_t portName[256];
-                    DWORD size = sizeof(portName);
-                    if (RegQueryValueExW(hKey, L"PortName", NULL, NULL, (LPBYTE)portName, &size) == ERROR_SUCCESS)
+                    wchar_t portNameBuffer[256]; // Buffer for the COM port name (e.g., "COM9").
+                    DWORD portNameBufferSize = sizeof(portNameBuffer);
+
+                    // Query the "PortName" value from the device's registry key.
+                    if (RegQueryValueExW(
+                        hDeviceRegistryKey, // Handle to the open registry key.
+                        L"PortName",        // Name of the registry value to query.
+                        NULL,               // Reserved, must be NULL.
+                        NULL,               // Optional: pointer to receive value type.
+                        (LPBYTE)portNameBuffer, // Buffer to receive the port name data.
+                        &portNameBufferSize // Size of the buffer.
+                    ) == ERROR_SUCCESS)
                     {
-                        RegCloseKey(hKey);
-                        SetupDiDestroyDeviceInfoList(hDevInfo);
-                        return std::wstring(portName); // Found it! (e.g., L"COM3")
+                        // --- Success! ---
+                        RegCloseKey(hDeviceRegistryKey);          // Close the registry key.
+                        SetupDiDestroyDeviceInfoList(hDevInfo); // Clean up the device info list.
+                        return std::wstring(portNameBuffer);    // Return the found COM port name.
                     }
-                    RegCloseKey(hKey);
+                    // If RegQueryValueExW failed, close the key anyway.
+                    RegCloseKey(hDeviceRegistryKey);
                 }
+                // Optional: Log GetLastError() if SetupDiOpenDevRegKey failed.
             }
         }
+        // Optional: Log GetLastError() if SetupDiGetDeviceRegistryPropertyW failed.
     }
 
+    // --- Cleanup and Return Not Found ---
+
+    // If the loop finishes without finding a match, clean up.
     SetupDiDestroyDeviceInfoList(hDevInfo);
-    return L""; // Pico not found
+    return L""; // Return empty string indicating Pico or Keeboar not found.
 }
 void PicoListenerThread()
 {
@@ -728,7 +787,7 @@ void PicoListenerThread()
 
         if (!connectedNow) {
             // If disconnected, try to find the Pico's COM port
-            std::wstring foundPort = FindPicoCOMPort();
+            std::wstring foundPort = FindPicoOrKeeboarCOMPort();
             if (!foundPort.empty()) {
                 if (OpenSerialPort(foundPort)) {
                     connectedNow = true;
